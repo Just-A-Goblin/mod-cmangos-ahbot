@@ -1,0 +1,935 @@
+/*
+ * CMangosAHBot — loot-simulation seller + buyer + progression gating.
+ *
+ * Mechanism and pricing formulas ported from cmangos/mangos-classic
+ * src/game/AuctionHouseBot/ (GPL-2.0). Progression gating per
+ * mod-cmangos-ahbot-progression-addendum_1.md. AzerothCore integration
+ * (transient Player, auction creation, hooks) verified in NOTES-verification.md.
+ */
+#include "CMangosAHBot.h"
+#include "CMangosAHBotConfig.h"
+#include "AuctionHouseMgr.h"
+#include "AuctionHouseSearcher.h"
+#include "DatabaseEnv.h"
+#include "Field.h"
+#include "QueryResult.h"
+#include "Item.h"
+#include "ItemTemplate.h"
+#include "ObjectMgr.h"
+#include "LootMgr.h"
+#include "SpellMgr.h"
+#include "SpellInfo.h"
+#include "SharedDefines.h"
+#include "DBCStores.h"
+#include "Player.h"
+#include "WorldSession.h"
+#include "ObjectAccessor.h"
+#include "MapMgr.h"
+#include "World.h"
+#include "Random.h"
+#include "Log.h"
+#include <algorithm>
+#include <ctime>
+#include <limits>
+#include <sstream>
+
+namespace
+{
+    constexpr uint32_t NOCAP = std::numeric_limits<uint32_t>::max();
+
+    // creature_template.rank -> config tuple index
+    //   0 Normal->0, 4 Rare->1, 1 Elite->2, 2 RareElite->3, 3 WorldBoss->4
+    inline int RankToBucket(uint8_t rank)
+    {
+        switch (rank)
+        {
+            case 0: return 0;
+            case 4: return 1;
+            case 1: return 2;
+            case 2: return 3;
+            case 3: return 4;
+            default: return 0;
+        }
+    }
+
+    inline void MinMerge(std::unordered_map<uint32_t, uint8_t>& m, uint32_t key, uint8_t exp)
+    {
+        auto it = m.find(key);
+        if (it == m.end() || exp < it->second)
+            m[key] = exp;
+    }
+}
+
+CMangosAHBot* CMangosAHBot::instance()
+{
+    static CMangosAHBot inst;
+    return &inst;
+}
+
+// ===========================================================================
+// Lifecycle
+// ===========================================================================
+
+bool CMangosAHBot::ResolveBotCharacter()
+{
+    const auto& cfg = gCMangosAHBotConfig;
+    if (cfg.account == 0 || cfg.guid == 0)
+    {
+        LOG_ERROR("module", "CMangosAHBot: Account/GUID unset — module stays disabled.");
+        return false;
+    }
+    QueryResult r = CharacterDatabase.Query(
+        "SELECT guid FROM characters WHERE account = {} AND guid = {}", cfg.account, cfg.guid);
+    if (!r)
+    {
+        LOG_ERROR("module", "CMangosAHBot: bot character guid {} not found on account {} — module stays disabled.",
+                  cfg.guid, cfg.account);
+        return false;
+    }
+    return true;
+}
+
+void CMangosAHBot::Initialize()
+{
+    const auto& cfg = gCMangosAHBotConfig;
+
+    if (!ResolveBotCharacter())
+    {
+        _ready = false;
+        return;
+    }
+
+    if (!_sourcesBuilt)
+    {
+        BuildVendorSet();
+        BuildClassifiedSources();
+        BuildProfessionPool();
+        BuildDisenchantPool();
+        LoadOverrides();
+        _sourcesBuilt = true;
+    }
+
+    RefreshProgression(true); // sets caps, builds filtered vectors, logs sizes
+
+    // Guardrail (plan §6): a critical empty vector means a source contributes nothing.
+    bool anyEmpty = _creature[0].empty() || _fishing.empty() || _gameobject.empty() ||
+                    _skinning.empty() || _disenchant.empty() || _profession.empty();
+    if (cfg.enable && anyEmpty)
+    {
+        LOG_ERROR("module", "CMangosAHBot: a critical loot vector is empty at current progression "
+            "(creatureN={} fishing={} go={} skin={} disen={} prof={}). Disabling — check source mapping.",
+            _creature[0].size(), _fishing.size(), _gameobject.size(),
+            _skinning.size(), _disenchant.size(), _profession.size());
+        _ready = false;
+        return;
+    }
+
+    _ready = (cfg.enable != 0);
+    LOG_INFO("module", "CMangosAHBot: initialized (ready={} state={} maxExp={} ilvlCap={}).",
+             _ready, _caps.state, _caps.maxExpansion,
+             _caps.itemLevelCap == NOCAP ? 0 : _caps.itemLevelCap);
+}
+
+void CMangosAHBot::ReloadData()
+{
+    LoadOverrides();
+    RefreshProgression(true);
+}
+
+// ===========================================================================
+// Enumeration + classification (Phase 3 / addendum Phase 3.5)
+// ===========================================================================
+
+uint8_t CMangosAHBot::ExpansionOfMap(uint32_t mapId) const
+{
+    if (MapEntry const* me = sMapStore.LookupEntry(mapId))
+        return static_cast<uint8_t>(me->expansionID);
+    return CMAHB_EXP_UNKNOWN;
+}
+
+uint8_t CMangosAHBot::ExpansionOfArea(uint32_t areaId) const
+{
+    if (AreaTableEntry const* a = sAreaTableStore.LookupEntry(areaId))
+        return ExpansionOfMap(a->mapid);
+    return CMAHB_EXP_UNKNOWN;
+}
+
+void CMangosAHBot::BuildVendorSet()
+{
+    _vendorItems.clear();
+    if (QueryResult r = WorldDatabase.Query("SELECT DISTINCT item FROM npc_vendor WHERE item > 0"))
+        do { _vendorItems.insert(r->Fetch()[0].Get<uint32_t>()); } while (r->NextRow());
+    LOG_INFO("module", "CMangosAHBot: vendor item set = {}", _vendorItems.size());
+}
+
+void CMangosAHBot::BuildClassifiedSources()
+{
+    for (auto& v : _creatureClassified) v.clear();
+    _gameobjectClassified.clear();
+    _fishingClassified.clear();
+    _skinningClassified.clear();
+    _excludedUnspawnedCreature = 0;
+    _excludedUnspawnedGO = 0;
+
+    // ---- creatures + skinning: entry -> (lootid, skinloot, rank) ----
+    struct CT { uint32_t lootid = 0; uint32_t skinloot = 0; uint8_t rank = 0; };
+    std::unordered_map<uint32_t, CT> ct;
+    if (QueryResult r = WorldDatabase.Query(
+            "SELECT entry, lootid, skinloot, `rank` FROM creature_template WHERE lootid > 0 OR skinloot > 0"))
+    {
+        do
+        {
+            Field* f = r->Fetch();
+            CT c;
+            c.lootid   = f[1].Get<uint32_t>();
+            c.skinloot = f[2].Get<uint32_t>();
+            c.rank     = static_cast<uint8_t>(f[3].Get<uint32_t>());
+            ct[f[0].Get<uint32_t>()] = c;
+        } while (r->NextRow());
+    }
+
+    std::unordered_map<uint32_t, uint8_t> lootExp, skinExp, lootRank;
+    if (QueryResult r = WorldDatabase.Query("SELECT id1, id2, id3, map FROM creature"))
+    {
+        do
+        {
+            Field* f = r->Fetch();
+            uint32_t ids[3] = { f[0].Get<uint32_t>(), f[1].Get<uint32_t>(), f[2].Get<uint32_t>() };
+            uint8_t exp = ExpansionOfMap(f[3].Get<uint32_t>());
+            if (exp == CMAHB_EXP_UNKNOWN)
+                continue;
+            for (uint32_t id : ids)
+            {
+                if (!id) continue;
+                auto it = ct.find(id);
+                if (it == ct.end()) continue;
+                if (it->second.lootid)
+                {
+                    MinMerge(lootExp, it->second.lootid, exp);
+                    lootRank[it->second.lootid] = it->second.rank;
+                }
+                if (it->second.skinloot)
+                    MinMerge(skinExp, it->second.skinloot, exp);
+            }
+        } while (r->NextRow());
+    }
+
+    // Bucket resolved creature lootids by rank; count unresolved.
+    std::unordered_map<uint32_t, bool> lootSeen;
+    for (auto& [entry, c] : ct)
+        if (c.lootid)
+            lootSeen[c.lootid];   // touch
+    for (auto& [lootId, exp] : lootExp)
+    {
+        int bucket = RankToBucket(lootRank.count(lootId) ? lootRank[lootId] : 0);
+        _creatureClassified[bucket].push_back({ lootId, exp });
+    }
+    for (auto& [skinId, exp] : skinExp)
+        _skinningClassified.push_back({ skinId, exp });
+
+    for (auto& [lootId, _] : lootSeen)
+        if (!lootExp.count(lootId)) ++_excludedUnspawnedCreature;
+
+    // ---- gameobjects: type 3 chest, Data1 = lootId ----
+    std::unordered_map<uint32_t, uint32_t> goLoot; // entry -> lootId
+    if (QueryResult r = WorldDatabase.Query(
+            "SELECT entry, Data1 FROM gameobject_template WHERE type = 3 AND Data1 > 0"))
+        do { Field* f = r->Fetch(); goLoot[f[0].Get<uint32_t>()] = f[1].Get<uint32_t>(); } while (r->NextRow());
+
+    std::unordered_map<uint32_t, uint8_t> goExp;
+    std::unordered_map<uint32_t, bool> goLootSeen;
+    for (auto& [e, l] : goLoot) goLootSeen[l];
+    if (QueryResult r = WorldDatabase.Query("SELECT id, map FROM gameobject"))
+    {
+        do
+        {
+            Field* f = r->Fetch();
+            uint32_t id = f[0].Get<uint32_t>();
+            uint8_t exp = ExpansionOfMap(f[1].Get<uint32_t>());
+            if (exp == CMAHB_EXP_UNKNOWN) continue;
+            auto it = goLoot.find(id);
+            if (it != goLoot.end())
+                MinMerge(goExp, it->second, exp);
+        } while (r->NextRow());
+    }
+    for (auto& [lootId, exp] : goExp)
+        _gameobjectClassified.push_back({ lootId, exp });
+    for (auto& [lootId, _] : goLootSeen)
+        if (!goExp.count(lootId)) ++_excludedUnspawnedGO;
+
+    // ---- fishing: entry IS an area id ----
+    if (QueryResult r = WorldDatabase.Query("SELECT DISTINCT entry FROM fishing_loot_template"))
+    {
+        do
+        {
+            uint32_t areaId = r->Fetch()[0].Get<uint32_t>();
+            uint8_t exp = ExpansionOfArea(areaId);
+            if (exp != CMAHB_EXP_UNKNOWN)
+                _fishingClassified.push_back({ areaId, exp });
+        } while (r->NextRow());
+    }
+
+    LOG_INFO("module", "CMangosAHBot: classified sources — creature[N/R/E/RE/WB]={}/{}/{}/{}/{} go={} fishing={} skin={} (unresolved creature={} go={})",
+        _creatureClassified[0].size(), _creatureClassified[1].size(), _creatureClassified[2].size(),
+        _creatureClassified[3].size(), _creatureClassified[4].size(),
+        _gameobjectClassified.size(), _fishingClassified.size(), _skinningClassified.size(),
+        _excludedUnspawnedCreature, _excludedUnspawnedGO);
+}
+
+void CMangosAHBot::BuildProfessionPool()
+{
+    // §2.3 in-memory scan of create-item profession spells; skill-rank per addendum §4 Layer 2b.
+    std::unordered_map<uint32_t, uint32_t> byItem; // itemId -> min skill rank
+    uint32_t storeSize = sSpellMgr->GetSpellInfoStoreSize();
+    for (uint32_t id = 0; id < storeSize; ++id)
+    {
+        SpellInfo const* spell = sSpellMgr->GetSpellInfo(id);
+        if (!spell)
+            continue;
+        if (!(spell->Attributes & 0x20) || !(spell->Attributes & 0x10000))
+            continue;
+
+        // Lowest required skill rank across this spell's skill-line abilities.
+        uint32_t minRank = 0;
+        bool haveRank = false;
+        SkillLineAbilityMapBounds bounds = sSpellMgr->GetSkillLineAbilityMapBounds(id);
+        for (auto it = bounds.first; it != bounds.second; ++it)
+        {
+            uint32_t r = it->second->MinSkillLineRank;
+            if (!haveRank || r < minRank) { minRank = r; haveRank = true; }
+        }
+
+        for (uint8_t e = 0; e < MAX_SPELL_EFFECTS; ++e)
+        {
+            if (spell->Effects[e].Effect == SPELL_EFFECT_CREATE_ITEM && spell->Effects[e].ItemType)
+            {
+                uint32_t itemId = spell->Effects[e].ItemType;
+                auto it = byItem.find(itemId);
+                if (it == byItem.end() || minRank < it->second)
+                    byItem[itemId] = minRank;
+            }
+        }
+    }
+
+    _professionClassified.clear();
+    _professionClassified.reserve(byItem.size());
+    for (auto& [itemId, rank] : byItem)
+        _professionClassified.push_back({ itemId, rank });
+
+    LOG_INFO("module", "CMangosAHBot: profession item pool = {} (low thousands expected on stock WotLK)",
+             _professionClassified.size());
+}
+
+void CMangosAHBot::BuildDisenchantPool()
+{
+    // Disenchant gated by item level of source items (addendum §4 Layer 1 special case).
+    _disenchantClassified.clear();
+    if (QueryResult r = WorldDatabase.Query(
+            "SELECT DisenchantID, MIN(ItemLevel) FROM item_template WHERE DisenchantID > 0 GROUP BY DisenchantID"))
+    {
+        do
+        {
+            Field* f = r->Fetch();
+            _disenchantClassified.push_back({ f[0].Get<uint32_t>(), f[1].Get<uint32_t>() });
+        } while (r->NextRow());
+    }
+    LOG_INFO("module", "CMangosAHBot: disenchant loot ids = {}", _disenchantClassified.size());
+}
+
+void CMangosAHBot::LoadOverrides()
+{
+    _overrides.clear();
+    if (QueryResult r = CharacterDatabase.Query(
+            "SELECT item, value, add_chance, min_amount, max_amount FROM cmangos_ahbot_items"))
+    {
+        do
+        {
+            Field* f = r->Fetch();
+            CmAHBOverride o;
+            o.value     = f[1].Get<uint32_t>();
+            o.addChance = f[2].Get<uint32_t>();
+            o.minAmount = f[3].Get<uint32_t>();
+            o.maxAmount = f[4].Get<uint32_t>();
+            _overrides[f[0].Get<uint32_t>()] = o;
+        } while (r->NextRow());
+    }
+    LOG_INFO("module", "CMangosAHBot: overrides loaded = {}", _overrides.size());
+}
+
+void CMangosAHBot::RebuildFilteredVectors()
+{
+    const uint8_t maxExp = _caps.maxExpansion;
+
+    for (int rank = 0; rank < (int)CMAHB_CREATURE_RANKS; ++rank)
+    {
+        _creature[rank].clear();
+        for (auto& c : _creatureClassified[rank])
+            if (c.expansion <= maxExp)
+                _creature[rank].push_back(c.lootId);
+    }
+    auto filt = [maxExp](const std::vector<CmAHBClassifiedId>& in, std::vector<uint32_t>& out)
+    {
+        out.clear();
+        for (auto& c : in)
+            if (c.expansion <= maxExp)
+                out.push_back(c.lootId);
+    };
+    filt(_gameobjectClassified, _gameobject);
+    filt(_fishingClassified,    _fishing);
+    filt(_skinningClassified,   _skinning);
+
+    _disenchant.clear();
+    for (auto& [id, ilvl] : _disenchantClassified)
+        if (_caps.itemLevelCap == NOCAP || ilvl <= _caps.itemLevelCap)
+            _disenchant.push_back(id);
+
+    _profession.clear();
+    for (auto& [itemId, rank] : _professionClassified)
+        if (_caps.skillCap == NOCAP || rank <= _caps.skillCap)
+            _profession.push_back(itemId);
+}
+
+// ===========================================================================
+// Progression (addendum §3 / §5)
+// ===========================================================================
+
+void CMangosAHBot::RefreshProgression(bool force)
+{
+    const auto& cfg = gCMangosAHBotConfig;
+    uint32_t now = static_cast<uint32_t>(time(nullptr));
+
+    if (!force && _lastProgRefresh && (now - _lastProgRefresh) < cfg.progRefreshInterval)
+        return;
+    bool firstRun = (_lastProgRefresh == 0);
+    _lastProgRefresh = now;
+
+    CmAHBCaps newCaps;
+    if (!cfg.progEnable)
+    {
+        newCaps.state = 255;
+        newCaps.maxExpansion = CMAHB_EXP_WOTLK;
+        newCaps.itemLevelCap = NOCAP;
+        newCaps.reqLevelCap  = NOCAP;
+        newCaps.skillCap     = NOCAP;
+    }
+    else
+    {
+        uint8_t state = CMangosAHBotProgression::GetEffectiveState();
+        newCaps = CMangosAHBotProgression::CapsForState(state);
+    }
+
+    if (firstRun || newCaps.state != _caps.state)
+    {
+        uint8_t oldState = _caps.state;
+        _caps = newCaps;
+        RebuildFilteredVectors();
+        LOG_INFO("module", "CMangosAHBot: progression {} -> {} (maxExp={} ilvlCap={} skillCap={}). "
+            "Vectors: creN={} creR={} creE={} creRE={} creWB={} go={} fish={} skin={} disen={} prof={}",
+            firstRun ? 0 : oldState, _caps.state, _caps.maxExpansion,
+            _caps.itemLevelCap == NOCAP ? 0 : _caps.itemLevelCap,
+            _caps.skillCap == NOCAP ? 0 : _caps.skillCap,
+            _creature[0].size(), _creature[1].size(), _creature[2].size(),
+            _creature[3].size(), _creature[4].size(),
+            _gameobject.size(), _fishing.size(), _skinning.size(), _disenchant.size(), _profession.size());
+    }
+}
+
+// ===========================================================================
+// Simulation (Phase 4)
+// ===========================================================================
+
+void CMangosAHBot::SimSource(const std::vector<uint32_t>& ids, LootStore const& store,
+                             const CmAHBSourceConfig& cfg, Player* bot, CmAHBItemMap& out)
+{
+    if (ids.empty())
+        return;
+
+    int32_t nsrc = (cfg.maxSources <= cfg.minSources)
+                   ? std::max(0, cfg.minSources)
+                   : irand(cfg.minSources, cfg.maxSources);
+    if (nsrc <= 0)
+        return;
+
+    for (int32_t i = 0; i < nsrc; ++i)
+    {
+        uint32_t lootId = ids[urand(0, static_cast<uint32_t>(ids.size() - 1))];
+        uint32_t nloot  = urand(cfg.minLootings, std::max(cfg.minLootings, cfg.maxLootings));
+        for (uint32_t j = 0; j < nloot; ++j)
+        {
+            // §2.1 CRITICAL: a fresh Loot per iteration. AC's Loot::AddItem caps at
+            // MAX_NR_LOOT_ITEMS (18); accumulating into one Loot silently truncates.
+            Loot loot;
+            if (loot.FillLoot(lootId, store, bot, true /*personal*/, true /*noEmptyError*/))
+                for (LootItem const& li : loot.items)
+                    out[li.itemid] += li.count;
+            // loot destroyed here (clear() in dtor)
+        }
+    }
+}
+
+void CMangosAHBot::SimProfession(CmAHBItemMap& out)
+{
+    if (_profession.empty())
+        return;
+
+    const auto& cfg = gCMangosAHBotConfig;
+    int32_t bmin = std::max(0, cfg.professionTuple[0]);
+    int32_t bmax = std::max(bmin, cfg.professionTuple[1]);
+    uint32_t budget = urand(static_cast<uint32_t>(bmin), static_cast<uint32_t>(bmax));
+    uint32_t pctMin = static_cast<uint32_t>(std::max(0, cfg.professionTuple[2]));
+    uint32_t pctMax = std::max(pctMin, static_cast<uint32_t>(std::max(0, cfg.professionTuple[3])));
+
+    for (uint32_t i = 0; i < budget; ++i)
+    {
+        uint32_t itemId = _profession[urand(0, static_cast<uint32_t>(_profession.size() - 1))];
+        ItemTemplate const* proto = sObjectMgr->GetItemTemplate(itemId);
+        if (!proto)
+            continue;
+
+        // CMaNGOS quality-decay roll (Phase 4.4): white 100%, green 50%, blue 25%, purple 12.5%.
+        uint32_t q = proto->Quality;
+        uint32_t flag = (q == 0) ? 1u : (1u << (q - 1));
+        if (urand(0, flag - 1) > 0)
+            continue;
+
+        uint32_t maxStack = std::max(1u, static_cast<uint32_t>(proto->GetMaxStackSize()));
+        uint32_t cnt = (pctMax > 0) ? std::max(1u, maxStack * urand(pctMin, pctMax) / 100u) : 1u;
+        out[itemId] += cnt;
+    }
+}
+
+void CMangosAHBot::ApplyOverridesToMap(CmAHBItemMap& out)
+{
+    for (auto& [itemId, ov] : _overrides)
+    {
+        if (ov.addChance == 0)
+            continue;
+        if (urand(0, 99) < ov.addChance)
+            out[itemId] += urand(ov.minAmount, std::max(ov.minAmount, ov.maxAmount));
+    }
+}
+
+void CMangosAHBot::AddLootToItemMap(Player* bot, CmAHBItemMap& out)
+{
+    const auto& cfg = gCMangosAHBotConfig;
+    for (int rank = 0; rank < (int)CMAHB_CREATURE_RANKS; ++rank)
+        SimSource(_creature[rank], LootTemplates_Creature, cfg.creature[rank], bot, out);
+    SimSource(_fishing,    LootTemplates_Fishing,    cfg.fishing,    bot, out);
+    SimSource(_gameobject, LootTemplates_Gameobject, cfg.gameobject, bot, out);
+    SimSource(_skinning,   LootTemplates_Skinning,   cfg.skinning,   bot, out);
+    SimSource(_disenchant, LootTemplates_Disenchant, cfg.disenchant, bot, out);
+    SimProfession(out);
+    ApplyOverridesToMap(out);
+}
+
+// ===========================================================================
+// Pricing + filters (Phase 5)
+// ===========================================================================
+
+bool CMangosAHBot::PassesFilters(ItemTemplate const* proto) const
+{
+    const auto& cfg = gCMangosAHBotConfig;
+    uint32_t q = proto->Quality, cls = proto->Class;
+    if (q >= CMAHB_MAX_QUALITY || cls >= CMAHB_MAX_CLASS)
+        return false;
+    if (cfg.valueMatrix[q][cls] == 0)
+        return false;
+    if (proto->Bonding == BIND_WHEN_PICKED_UP || proto->Bonding == BIND_QUEST_ITEM)
+        return false;
+    if (cls == ITEM_CLASS_QUEST)
+        return false;
+    if (proto->Flags & ITEM_FLAG_HAS_LOOT)   // right-clickable loot container
+        return false;
+
+    auto ov = _overrides.find(proto->ItemId);
+    if (ov != _overrides.end() && ov->second.value == 0 && ov->second.addChance == 0)
+        return false; // explicit blacklist
+    return true;
+}
+
+uint64_t CMangosAHBot::CalculateBuyoutPrice(ItemTemplate const* proto) const
+{
+    // Ported literally from CMaNGOS CalculateBuyoutPrice — do not "fix" the oddities (plan §6).
+    const auto& cfg = gCMangosAHBotConfig;
+    uint32_t q = proto->Quality, cls = proto->Class;
+    if (q >= CMAHB_MAX_QUALITY || cls >= CMAHB_MAX_CLASS)
+        return 0;
+
+    uint64_t base = proto->BuyPrice;
+    if (proto->BuyPrice == 0 || (proto->SellPrice > 0 && proto->BuyPrice / proto->SellPrice > 5))
+        base = static_cast<uint64_t>(proto->SellPrice) * (q <= ITEM_QUALITY_NORMAL ? 4 : 5);
+    if (base == 0)
+        return 0;
+
+    uint32_t pct = (cfg.valueVendor && _vendorItems.count(proto->ItemId))
+                   ? 100 : cfg.valueMatrix[q][cls];
+    if (pct == 0)
+        return 0;
+    return base * pct / 100;
+}
+
+uint64_t CMangosAHBot::ValueWithVariance(uint64_t value) const
+{
+    uint32_t v = std::min(99u, gCMangosAHBotConfig.valueVariance);
+    return value * urand(100 - v, 100 + v) / 100;
+}
+
+// ===========================================================================
+// Sell pass (Phase 5 / addendum Layer 3)
+// ===========================================================================
+
+void CMangosAHBot::SellPass(Player* bot, uint32_t houseIdx, bool prefill)
+{
+    const auto& cfg = gCMangosAHBotConfig;
+
+    if (!prefill && urand(0, 99) >= cfg.chanceSell)
+        return;
+    if (!prefill && cfg.hardCap > 0 && BotAuctionCount(houseIdx) >= cfg.hardCap)
+        return;
+
+    uint32_t fid = CMAHB_AH_FIDS[houseIdx];
+    AuctionHouseEntry const* ahEntry = sAuctionMgr->GetAuctionHouseEntryFromFactionTemplate(fid);
+    AuctionHouseObject* auctionHouse = sAuctionMgr->GetAuctionsMap(fid);
+    if (!ahEntry || !auctionHouse)
+        return;
+
+    CmAHBItemMap itemMap;
+    AddLootToItemMap(bot, itemMap);
+
+    auto trans = CharacterDatabase.BeginTransaction();
+    uint32_t posted = 0;
+
+    for (auto& [itemId, totalCount] : itemMap)
+    {
+        ItemTemplate const* proto = sObjectMgr->GetItemTemplate(itemId);
+        if (!proto || !PassesFilters(proto))
+            continue;
+
+        // Layer 3 safety net (addendum §4): anything over the progression caps here
+        // leaked through source gating. Drop + count; sustained growth == mapping bug.
+        if ((_caps.itemLevelCap != NOCAP && proto->ItemLevel > _caps.itemLevelCap) ||
+            (_caps.reqLevelCap  != NOCAP && proto->RequiredLevel > _caps.reqLevelCap))
+        {
+            ++_layer3Dropped;
+            continue;
+        }
+
+        // Per-unit price: override value wins, else CMaNGOS formula.
+        uint64_t unit;
+        auto ov = _overrides.find(itemId);
+        if (ov != _overrides.end() && ov->second.value > 0)
+            unit = ValueWithVariance(ov->second.value);
+        else
+        {
+            unit = CalculateBuyoutPrice(proto);
+            if (unit == 0)
+                continue;
+            unit = ValueWithVariance(unit);
+        }
+        if (unit == 0)
+            continue;
+
+        uint32_t maxStack = std::max(1u, static_cast<uint32_t>(proto->GetMaxStackSize()));
+        uint32_t remaining = totalCount;
+        while (remaining > 0)
+        {
+            uint32_t stack = std::min(remaining, maxStack);
+            remaining -= stack;
+
+            uint64_t buyout64 = unit * stack;
+            uint32_t buyout = buyout64 > NOCAP ? NOCAP : static_cast<uint32_t>(buyout64);
+            if (buyout == 0)
+                continue;
+            uint32_t startbid = static_cast<uint32_t>(
+                static_cast<uint64_t>(buyout) * urand(cfg.bidMin, std::max(cfg.bidMin, cfg.bidMax)) / 100);
+
+            Item* item = Item::CreateItem(itemId, 1, bot);
+            if (!item)
+                continue;
+            item->AddToUpdateQueueOf(bot);
+            if (uint32_t rp = Item::GenerateItemRandomPropertyId(itemId))
+                item->SetItemRandomProperties(rp);
+            item->SetCount(stack);
+
+            uint32_t durationSecs = urand(std::max(1u, cfg.timeMin), std::max(std::max(1u, cfg.timeMin), cfg.timeMax)) * 3600u;
+            uint32_t deposit = sAuctionMgr->GetAuctionDeposit(ahEntry, durationSecs, item, stack);
+
+            AuctionEntry* ae      = new AuctionEntry();
+            ae->Id                = sObjectMgr->GenerateAuctionID();
+            ae->houseId           = AuctionHouseId(CMAHB_AH_IDS[houseIdx]);
+            ae->item_guid         = item->GetGUID();
+            ae->item_template     = item->GetEntry();
+            ae->itemCount         = item->GetCount();
+            ae->owner             = bot->GetGUID();
+            ae->startbid          = startbid;
+            ae->buyout            = buyout;
+            ae->bid               = 0;
+            ae->deposit           = deposit;
+            ae->expire_time       = time(nullptr) + static_cast<time_t>(durationSecs);
+            ae->auctionHouseEntry = ahEntry;
+
+            item->SaveToDB(trans);
+            item->RemoveFromUpdateQueueOf(bot);
+            sAuctionMgr->AddAItem(item);
+            auctionHouse->AddAuction(ae);
+            ae->SaveToDB(trans);
+            ++posted;
+        }
+    }
+
+    if (posted > 0)
+        CharacterDatabase.CommitTransaction(trans);
+
+    LOG_DEBUG("module", "CMangosAHBot: sell house={} posted={} layer3Dropped={}",
+              CMAHB_AH_IDS[houseIdx], posted, _layer3Dropped);
+}
+
+// ===========================================================================
+// Buyer (Phase 6)
+// ===========================================================================
+
+void CMangosAHBot::BuyPass(Player* bot, uint32_t houseIdx)
+{
+    const auto& cfg = gCMangosAHBotConfig;
+    if (urand(0, 99) >= cfg.chanceBuy)
+        return;
+
+    uint32_t fid = CMAHB_AH_FIDS[houseIdx];
+    AuctionHouseObject* auctionHouse = sAuctionMgr->GetAuctionsMap(fid);
+    if (!auctionHouse)
+        return;
+
+    // §6.2: buyout mutates the auction map — collect targets, execute AFTER iterating.
+    std::vector<uint32_t> buyoutIds;
+
+    for (auto it = auctionHouse->GetAuctionsBegin(); it != auctionHouse->GetAuctionsEnd(); ++it)
+    {
+        AuctionEntry* auction = it->second;
+        if (!auction || auction->owner == bot->GetGUID())
+            continue; // never bid on our own listings
+
+        ItemTemplate const* proto = sObjectMgr->GetItemTemplate(auction->item_template);
+        if (!proto)
+            continue;
+
+        uint64_t perUnit = CalculateBuyoutPrice(proto);
+        if (perUnit == 0)
+            continue;
+
+        // Valuation mirrors the seller (buyer coherence, plan §0).
+        uint64_t valuation = perUnit * auction->itemCount * cfg.buyValue / 100;
+        if (valuation == 0)
+            continue;
+
+        // Buy out when the ask sits below our valuation.
+        if (auction->buyout > 0 && auction->buyout <= valuation)
+        {
+            buyoutIds.push_back(auction->Id);
+            continue;
+        }
+
+        // Otherwise bid up to valuation (bidding does not invalidate the map).
+        uint32_t curPrice = auction->bid ? auction->bid : auction->startbid;
+        uint32_t nextBid = std::max<uint32_t>(curPrice + 1, auction->startbid);
+        if (nextBid <= valuation && (auction->buyout == 0 || nextBid < auction->buyout) &&
+            auction->bidder != bot->GetGUID())
+        {
+            auto trans = CharacterDatabase.BeginTransaction();
+            if (auction->bidder)
+                sAuctionMgr->SendAuctionOutbiddedMail(auction, nextBid, bot, trans);
+            auction->bidder = bot->GetGUID();
+            auction->bid = nextBid;
+            sAuctionMgr->GetAuctionHouseSearcher()->UpdateBid(auction);
+            CharacterDatabase.Execute(
+                "UPDATE auctionhouse SET buyguid = '{}', lastbid = '{}' WHERE id = '{}'",
+                auction->bidder.GetCounter(), auction->bid, auction->Id);
+            CharacterDatabase.CommitTransaction(trans);
+        }
+    }
+
+    // Deferred buyouts.
+    for (uint32_t id : buyoutIds)
+    {
+        AuctionEntry* auction = auctionHouse->GetAuction(id);
+        if (!auction)
+            continue;
+        auto trans = CharacterDatabase.BeginTransaction();
+        if (auction->bidder && auction->bidder != bot->GetGUID())
+            sAuctionMgr->SendAuctionOutbiddedMail(auction, auction->buyout, bot, trans);
+        auction->bidder = bot->GetGUID();
+        auction->bid = auction->buyout;
+        sAuctionMgr->SendAuctionSalePendingMail(auction, trans);
+        sAuctionMgr->SendAuctionSuccessfulMail(auction, trans);
+        sAuctionMgr->SendAuctionWonMail(auction, trans);
+        auction->DeleteFromDB(trans);
+        CharacterDatabase.CommitTransaction(trans);
+        sAuctionMgr->RemoveAItem(auction->item_guid);
+        auctionHouse->RemoveAuction(auction);
+    }
+}
+
+// ===========================================================================
+// Update — rotation + tick compensation (plan §2.4)
+// ===========================================================================
+
+void CMangosAHBot::WithTransientBot(const std::function<void(Player*)>& fn)
+{
+    const auto& cfg = gCMangosAHBotConfig;
+    std::string accountName = "CMangosAHBot" + std::to_string(cfg.account);
+    WorldSession session(cfg.account, std::move(accountName), 0, nullptr,
+                         SEC_PLAYER, sWorld->getIntConfig(CONFIG_EXPANSION),
+                         0, LOCALE_enUS, 0, false, false, 0);
+    Player bot(&session);
+    bot.Initialize(cfg.guid);
+
+    // Give the bot a valid base map + position. LootTemplate::Process evaluates
+    // per-row CONDITIONS against the looter — CONDITION_TEAM -> GetTeamId, and
+    // CONDITION_AREAID/ZONEID -> GetZoneId -> GetMap(). On a mapless transient
+    // player GetMap() asserts (Object.h:625): that is the crash. SetMap is a safe
+    // pointer-set here (the bot is never AddToWorld'd), so condition eval reads a
+    // real map/zone instead of dereferencing null. Detached again before the
+    // Player is destroyed so teardown matches the mapless construction path.
+    // (Zone-conditional drops evaluate as Elwynn/map 0 — a minor, documented skew.)
+    bot.Relocate(-8949.95f, -132.493f, 83.5312f, 0.0f); // Northshire, map 0
+    bot.SetMap(sMapMgr->CreateBaseMap(0));
+
+    // NOT registered in ObjectAccessor: the listing/buying path uses this pointer
+    // directly; an unregistered owner makes Item::GetOwner() return null so the
+    // item map-update path is skipped, and the gold sink runs off the guid-based
+    // MailScript. Registration would also expose it to world-player iteration.
+    fn(&bot);
+
+    bot.ResetMap();
+}
+
+void CMangosAHBot::Update()
+{
+    if (!_ready)
+        return;
+
+    const auto& cfg = gCMangosAHBotConfig;
+    RefreshProgression(false);
+
+    // One tightly-scoped transient player PER pass (not one held across all steps):
+    // a mapless bot left registered while other systems run trips GetMap().
+    for (uint32_t step = 0; step < cfg.tickCompensation; ++step)
+    {
+        _houseAction = (_houseAction + 1) % 6;
+        uint32_t house = _houseAction % CMAHB_HOUSE_COUNT;
+        if (_houseAction < CMAHB_HOUSE_COUNT)
+            WithTransientBot([&](Player* b) { SellPass(b, house, false); });
+        else
+            WithTransientBot([&](Player* b) { BuyPass(b, house); });
+    }
+}
+
+// ===========================================================================
+// Rebuild + overrides + reporting (Phase 7)
+// ===========================================================================
+
+uint32_t CMangosAHBot::BotAuctionCount(uint32_t houseIdx) const
+{
+    QueryResult r = CharacterDatabase.Query(
+        "SELECT COUNT(*) FROM auctionhouse WHERE itemowner = {} AND houseid = {}",
+        gCMangosAHBotConfig.guid, CMAHB_AH_IDS[houseIdx]);
+    return r ? (*r)[0].Get<uint32_t>() : 0;
+}
+
+void CMangosAHBot::ExpireBotAuctions(uint32_t forHouse)
+{
+    for (uint32_t h = 0; h < CMAHB_HOUSE_COUNT; ++h)
+    {
+        if (forHouse != CMAHB_HOUSE_COUNT && forHouse != h)
+            continue;
+        AuctionHouseObject* ah = sAuctionMgr->GetAuctionsMap(CMAHB_AH_FIDS[h]);
+        if (!ah)
+            continue;
+
+        std::vector<uint32_t> ids;
+        for (auto it = ah->GetAuctionsBegin(); it != ah->GetAuctionsEnd(); ++it)
+            if (it->second && it->second->owner.GetCounter() == gCMangosAHBotConfig.guid)
+                ids.push_back(it->first);
+
+        auto trans = CharacterDatabase.BeginTransaction();
+        for (uint32_t id : ids)
+        {
+            AuctionEntry* a = ah->GetAuction(id);
+            if (!a) continue;
+            a->DeleteFromDB(trans);
+            sAuctionMgr->RemoveAItem(a->item_guid, true, &trans);
+            ah->RemoveAuction(a);
+        }
+        CharacterDatabase.CommitTransaction(trans);
+    }
+}
+
+void CMangosAHBot::Rebuild(bool /*all*/, uint32_t forHouse)
+{
+    if (!_ready)
+        return;
+    const auto& cfg = gCMangosAHBotConfig;
+
+    ExpireBotAuctions(forHouse);
+
+    // Unlike CMaNGOS (whose per-pass output is tiny), each SellPass here posts the
+    // whole filtered itemMap — hundreds to low-thousands of auctions. A handful of
+    // passes fills a realistic AH, so we cap hard: a large count would both freeze
+    // the world thread and (previously) crash via a long-lived transient player.
+    (void)cfg;
+    const uint32_t passes = 8;
+
+    for (uint32_t p = 0; p < passes; ++p)
+        for (uint32_t h = 0; h < CMAHB_HOUSE_COUNT; ++h)
+            if (forHouse == CMAHB_HOUSE_COUNT || forHouse == h)
+                WithTransientBot([&](Player* b) { SellPass(b, h, true); }); // prefill
+
+    LOG_INFO("module", "CMangosAHBot: rebuild complete ({} passes/house).", passes);
+}
+
+void CMangosAHBot::SetOverride(uint32_t item, uint32_t value, uint32_t chance, uint32_t minA, uint32_t maxA)
+{
+    CmAHBOverride o{ value, chance, minA, maxA };
+    _overrides[item] = o;
+    CharacterDatabase.Execute(
+        "REPLACE INTO cmangos_ahbot_items (item, value, add_chance, min_amount, max_amount) "
+        "VALUES ({}, {}, {}, {}, {})", item, value, chance, minA, maxA);
+}
+
+void CMangosAHBot::ResetOverride(uint32_t item)
+{
+    _overrides.erase(item);
+    CharacterDatabase.Execute("DELETE FROM cmangos_ahbot_items WHERE item = {}", item);
+}
+
+std::string CMangosAHBot::StatusReport() const
+{
+    std::ostringstream ss;
+    ss << "CMangosAHBot: ready=" << (_ready ? "yes" : "no")
+       << " state=" << (int)_caps.state
+       << " maxExp=" << (int)_caps.maxExpansion
+       << " ilvlCap=" << (_caps.itemLevelCap == NOCAP ? 0 : _caps.itemLevelCap)
+       << " layer3Dropped=" << _layer3Dropped
+       << " | auctions A/H/N=" << BotAuctionCount(0) << "/" << BotAuctionCount(1) << "/" << BotAuctionCount(2);
+    return ss.str();
+}
+
+std::string CMangosAHBot::ProgressionReport() const
+{
+    const auto& cfg = gCMangosAHBotConfig;
+    std::ostringstream ss;
+    ss << "Progression: enable=" << cfg.progEnable
+       << " source=" << cfg.progSource
+       << " effectiveState=" << (int)_caps.state
+       << " maxExpansion=" << (int)_caps.maxExpansion
+       << " ilvlCap=" << (_caps.itemLevelCap == NOCAP ? 0 : _caps.itemLevelCap)
+       << " skillCap=" << (_caps.skillCap == NOCAP ? 0 : _caps.skillCap)
+       << " reqLevelCap=" << (_caps.reqLevelCap == NOCAP ? 0 : _caps.reqLevelCap)
+       << "\nVectors: creN=" << _creature[0].size() << " creR=" << _creature[1].size()
+       << " creE=" << _creature[2].size() << " creRE=" << _creature[3].size()
+       << " creWB=" << _creature[4].size()
+       << " go=" << _gameobject.size() << " fish=" << _fishing.size()
+       << " skin=" << _skinning.size() << " disen=" << _disenchant.size()
+       << " prof=" << _profession.size()
+       << "\nUnresolved: creature=" << _excludedUnspawnedCreature << " go=" << _excludedUnspawnedGO;
+    return ss.str();
+}

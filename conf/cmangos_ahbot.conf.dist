@@ -1,0 +1,122 @@
+#
+# mod-cmangos-ahbot configuration
+#
+# A loot-simulation auction house bot: it executes the server's real loot
+# tables (the same LootTemplate::Process path a dying mob runs) and lists what
+# falls out, so rarity / stack sizes / item mix are inherited from the world DB.
+# See mod-cmangos-ahbot-plan.md and the progression addendum.
+#
+# The `CMangosAHBot.` prefix avoids colliding with mod-ah-bot's
+# `AuctionHouseBot.` keys, so both may be installed at once (keep mod-ah-bot's
+# seller AND buyer disabled, and use a SEPARATE bot account).
+
+[worldserver]
+
+########################################
+# Identity / lifecycle
+########################################
+
+# Master switch. 0 = module inert.
+CMangosAHBot.Enable = 0
+
+# The bot's OWN account and character guid. This character must exist and never
+# be logged in by a human. NOT the player account used for progression below.
+CMangosAHBot.Account = 0
+CMangosAHBot.GUID    = 0
+
+# Internal 20s rotation steps per 60s core auction hook (plan §2.4). Keep at 3
+# unless the core's auction update interval changes.
+CMangosAHBot.TickCompensation = 3
+
+########################################
+# Flow gates (percent per pass)
+########################################
+
+CMangosAHBot.Chance.Sell = 10
+CMangosAHBot.Chance.Buy  = 10
+
+########################################
+# Loot source tuples: minSources, maxSources, minLootings, maxLootings
+#   - minSources may be NEGATIVE ("usually nothing this pass")
+#   - copy the semantics from CMaNGOS ahbot.conf.dist.in; these are its defaults
+########################################
+
+CMangosAHBot.Loot.Creature.Normal    =  30, 35,  8, 12
+CMangosAHBot.Loot.Creature.Rare      =   0, 10,  1,  1
+CMangosAHBot.Loot.Creature.Elite     =  30, 34,  1,  2
+CMangosAHBot.Loot.Creature.RareElite = -10,  2,  1,  1
+CMangosAHBot.Loot.Creature.WorldBoss = -20,  1,  1,  1
+CMangosAHBot.Loot.Disenchant         =  10, 12,  1,  1
+CMangosAHBot.Loot.Fishing            =   3,  5, 30, 40
+CMangosAHBot.Loot.Gameobject         =  13, 16,  7, 11
+CMangosAHBot.Loot.Skinning           =   3,  5, 50, 50
+
+# Profession tuple is (countMin, countMax, stackPctMin, stackPctMax):
+# how many crafted items to inject per pass, and each as a % of its max stack.
+CMangosAHBot.Items.Profession        =  80, 90,  0, 50
+
+########################################
+# Value matrix — per-quality lists of 17 per-class percentages.
+# Class index order (0..16):
+#   0 Consumable 1 Container 2 Weapon 3 Gem 4 Armor 5 Reagent 6 Projectile
+#   7 TradeGoods 8 Generic 9 Recipe 10 Money 11 Quiver 12 Quest 13 Key
+#   14 Permanent 15 Miscellaneous 16 Glyph
+# A 0 in a cell means that (quality,class) is never listed.
+# NOTE: these defaults are approximations — copy the exact numbers from
+# CMaNGOS ahbot.conf.dist.in for a faithful economy (plan §5).
+########################################
+
+CMangosAHBot.Value.Poor      = 0,0,0,0,0,0,0,100,0,0,0,0,0,0,0,100,0
+CMangosAHBot.Value.Normal    = 150,150,150,150,150,150,150,150,0,150,0,150,0,0,0,150,150
+CMangosAHBot.Value.Uncommon  = 200,200,200,200,200,200,200,200,0,200,0,200,0,0,0,200,200
+CMangosAHBot.Value.Rare      = 300,300,300,300,300,300,300,300,0,300,0,300,0,0,0,300,300
+CMangosAHBot.Value.Epic      = 400,400,400,400,400,400,400,400,0,400,0,400,0,0,0,400,400
+CMangosAHBot.Value.Legendary = 500,500,500,500,500,500,500,500,0,500,0,500,0,0,0,500,500
+CMangosAHBot.Value.Artifact  = 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+
+# Vendor-sold items priced at 100% of the computed base (CMaNGOS behaviour).
+CMangosAHBot.Value.Vendor   = 1
+# +/- percent applied to every price.
+CMangosAHBot.Value.Variance = 10
+
+########################################
+# Bid / duration / buyer
+########################################
+
+CMangosAHBot.Bid.Min   = 75   # start bid as % of buyout
+CMangosAHBot.Bid.Max   = 90
+CMangosAHBot.Buy.Value = 90   # buyer values an ask up to buyout * count * this/100
+CMangosAHBot.Time.Min  = 2    # listing duration hours
+CMangosAHBot.Time.Max  = 24
+
+# Runaway guard only (NOT a setpoint). 0 = unlimited. Skips a house's sell pass
+# when the bot already owns more than this many auctions there.
+CMangosAHBot.HardCap = 0
+
+########################################
+# Progression gating (addendum). Requires mod-individual-progression for a live
+# state; with IP absent the query returns nothing => state 0 (Vanilla), or set
+# Progression.Enable = 0 to disable gating entirely.
+########################################
+
+CMangosAHBot.Progression.Enable          = 1
+CMangosAHBot.Progression.Source          = 1     # 0 static, 1 account (default), 2 highest online
+CMangosAHBot.Progression.AccountId       = 0     # the PLAYER's account for Source=1 — NOT the bot account
+CMangosAHBot.Progression.Static          = 0     # used when Source=0
+CMangosAHBot.Progression.ExcludeAccounts = ""    # comma-separated, for Source=2 with playerbots
+CMangosAHBot.Progression.RefreshInterval = 300   # seconds
+
+# Expansion unlock thresholds (IP ProgressionState values).
+CMangosAHBot.Progression.TbcAtState      = 8
+CMangosAHBot.Progression.WotlkAtState    = 13
+
+# Item level cap per state, index = ProgressionState 0..18 (19 entries; index 11
+# duplicates 10 for the commented-out TBC_TIER_3). Approximations — tune in Phase 8.
+CMangosAHBot.Progression.ItemLevelCaps   = 66,71,71,76,76,81,81,92,115,133,141,141,154,200,226,245,264,277,284
+
+# Profession skill-rank caps per expansion (0/1/2).
+CMangosAHBot.Progression.SkillCaps       = 300,375,450
+
+# Exclude loot sources with no spawn row (unresolvable map). Recommended 1;
+# including them lets instance-summoned adds leak into the wrong era.
+CMangosAHBot.Progression.ExcludeUnspawned = 1
