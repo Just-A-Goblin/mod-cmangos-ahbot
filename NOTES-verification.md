@@ -58,3 +58,170 @@ scratch worldserver (base plan Phase 0.2, Phase 8):
 - All nine loot-id vectors non-empty on stock `acore_world` (Phase 3 acceptance).
 - CSV dump of AH contents (`item_id, quality, class, subclass, item_level, stack, bid, buyout, owner`).
 - Addendum acceptance: at `Progression.Static = 0` every resolvable source maps to `expansionID == 0`; spot-check Outland/Northrend loot ids absent.
+
+---
+
+# Addendum 2 (Crafting) — Phase C0 verification (C-A1..C-A10)
+
+Verification of `mod-cmangos-ahbot-crafting-addendum_2.md` §1, run **2026-08-19** against
+the same reference tree and a **live `acore_world`** (`mysql -u acore`, server up, core
+HEAD still `dfae3da` on `Playerbot`). Source citations are relative to
+`/home/leo/wow/azerothcore`; every DB claim below shows the query and the row counts it
+returned.
+
+**Two rows diverge from the spec and change the design — flagged in the phase summary:**
+**C-A3** (AC uses a *direct* recipe→spell encoding, not the assumed `SPELL_EFFECT_LEARN_SPELL`
+effect-walk) and **C-A9** (Enchanting *does* have listable pre-WotLK products). The core wins;
+the design is adapted minimally as noted.
+
+| #     | Assumption (abridged)                                                        | Result | Where |
+|-------|------------------------------------------------------------------------------|--------|-------|
+| C-A1  | Reagents as `Reagent[8]`/`ReagentCount[8]`                                    | **CONFIRMED** | see below |
+| C-A2  | AC skill-up formula reachable (grey=`TrivialHigh`, yellow=`TrivialLow`, green=mid) | **CONFIRMED** (cite corrected to `PlayerUpdates.cpp`) | see below |
+| C-A3  | Recipe item → crafting spell resolution                                      | **CONFIRMED w/ DESIGN CHANGE** (direct trigger-6, not effect-walk) | see below |
+| C-A4  | Trainer-taught recipes enumerable by spell id                                | **CONFIRMED** | see below |
+| C-A5  | CD recipes detectable via `RecoveryTime`/`CategoryRecoveryTime` ≥ 86 400 000 | **CONFIRMED (fields)** / runtime threshold **DEFERRED to C1** | see below |
+| C-A6  | Herb/ore nodes already flow through the type-3 gameobject vector             | **CONFIRMED** | see below |
+| C-A7  | Live bot listings iterable in-memory per house (no SQL)                      | **CONFIRMED** | see below |
+| C-A8  | Skill-line ids (171/164/333/202/165/197/185/129/755/773)                     | **CONFIRMED** | see below |
+| C-A9  | Enchanting has no listable product before WotLK vellums                      | **CONTRADICTED — design correction** | see below |
+| C-A10 | Module-local seeded RNG independent of core `urand`                          | **CONFIRMED** | see below |
+
+---
+
+### C-A1 — reagents = `Reagent[8]` / `ReagentCount[8]` — **CONFIRMED**
+`src/server/game/Spells/SpellInfo.h:397-398`
+`std::array<int32, MAX_SPELL_REAGENTS> Reagent;` / `std::array<uint32, MAX_SPELL_REAGENTS> ReagentCount;`.
+`MAX_SPELL_REAGENTS` = **8** at `src/server/shared/DataStores/DBCStructure.h:1675`. Access on the
+`SpellInfo` the profession scan already holds: `spell->Reagent[i]` / `spell->ReagentCount[i]`,
+`i ∈ [0,8)`, `Reagent[i] > 0` marks a live slot (`int32`, so guard the sentinel).
+
+### C-A2 — AC's own skill-up formula — **CONFIRMED** (spec cite corrected)
+Spec cited `Player.cpp`; the function is in **`src/server/game/Entities/Player/PlayerUpdates.cpp`**.
+- `Player::UpdateCraftSkill(uint32 spellid)` **:823** resolves the spell's `SkillLineAbilityMap`
+  and calls, **:850-858**:
+  `UpdateSkillPro(SkillLine, SkillGainChance(SkillValue, TrivialSkillLineRankHigh, (High+Low)/2, TrivialSkillLineRankLow), craft_skill_gain)`.
+  This matches the spec exactly: **grey = `TrivialSkillLineRankHigh`, green = midpoint, yellow = `TrivialSkillLineRankLow`.**
+- `SkillGainChance(SkillValue, Gray, Green, Yellow)` inline **:749-759**:
+  `>= Gray → CONFIG_SKILL_CHANCE_GREY*10`, `>= Green → GREEN*10`, `>= Yellow → YELLOW*10`,
+  else `ORANGE*10`. Return is **per-mille** (percent × 10). Stock config defaults:
+  grey 0, green 25, yellow 75, orange 100 (i.e. below-yellow crafts skill 100 % of the time,
+  grey never). `UpdateSkillPro` **:912** early-returns on `Chance <= 0` (grey case).
+- Trivial ranks: `SkillLineAbilityEntry::TrivialSkillLineRankHigh` / `...Low` at
+  `src/server/shared/DataStores/DBCStructure.h:1645-1646`.
+- **Port note (constraint #7):** reproduce this branch verbatim in the offline simulator —
+  read `CONFIG_SKILL_CHANCE_*` defaults into the fixture; do not invent a curve.
+
+### C-A3 — recipe item → crafting spell — **CONFIRMED, with a design change**
+`ITEM_CLASS_RECIPE = 9` at `src/server/game/Entities/Item/ItemTemplate.h:300` (3,066 rows:
+`SELECT COUNT(*) FROM item_template WHERE class=9;` → **3066**).
+
+The spec assumed a two-hop walk (item on-use spell → `SPELL_EFFECT_LEARN_SPELL` → craft spell).
+**AC encodes it directly.** Item on-use spells live in `_Spell Spells[MAX_ITEM_PROTO_SPELLS=5]`
+(`ItemTemplate.h:589,615,662`); the learn trigger is `ITEM_SPELLTRIGGER_LEARN_SPELL_ID = 6`
+(`ItemTemplate.h:88`, comment: *"used in item_template.spell_2 with spell_id with SPELL_GENERIC_LEARN in spell_1"*).
+
+5-recipe walk (`SELECT entry,name,subclass,spellid_1,spelltrigger_1,spellid_2,spelltrigger_2 FROM item_template WHERE class=9 AND entry IN (...)`):
+
+| recipe item | name | acquisition class | `spellid_1`/`trig` | `spellid_2`/`trig` = **craft spell** |
+|---|---|---|---|---|
+| 6045  | Plans: Iron Counterweight        | trainer/drop (BS) | 483 / 0 | **7222** / 6 |
+| 11167 | Formula: Enchant Boots – L.Spirit| vendor (Ench)     | 483 / 0 | **13687** / 6 |
+| 20757 | Formula: Brilliant Mana Oil      | drop (Ench)       | 483 / 0 | **25130** / 6 |
+| 44494 | Formula: Enchant Weapon – Lifeward| drop (Ench, WotLK)| 483 / 0 | **44576** / 6 |
+
+Pattern holds across the table: `spellid_1 = 483` (generic "Learning"), `spelltrigger_1 = 0`;
+the **craft spell is `spellid_2` where `spelltrigger_2 = 6`**. Coverage
+(`SELECT SUM(spelltrigger_2=6), SUM(spellid_1=483), COUNT(*) FROM item_template WHERE class=9`):
+**2034 / 2034 / 3066**. The 1032 non-matches are dominated by **subclass 0 = Book**
+(943 rows, class-ability Tomes with all-zero spell cols — *not* profession recipes, correctly
+excluded); profession subclasses 1–10 are ≈ all trigger-6 (e.g. JC subclass 10: 466/480,
+LW subclass 1: 359/395).
+
+**Design adaptation (recorded):** rarity resolver = for craft spell `S`, its recipe item is
+`SELECT entry FROM item_template WHERE class=9 AND spelltrigger_2=6 AND spellid_2=S`. Read
+`spellid_2` **directly**; do not chase `SPELL_EFFECT_LEARN_SPELL`. Trainer-taught recipes have
+**no** recipe item (taught straight off the trainer) → resolve those via C-A4. The taught-spell →
+`SPELL_EFFECT_CREATE_ITEM` → product hop is DBC-resident and is already exercised by the base
+module's profession scan (3202 items live, per status); re-log per-profession graph counts in C1.
+
+### C-A4 — trainer recipes enumerable by spell id — **CONFIRMED**
+`npc_trainer` (`ID`,`SpellID` composite PK; `SHOW COLUMNS`) — **4934** rows; AC's current
+`trainer`+`trainer_spell` system also populated (`trainer_spell` **6769** rows). Trainer-taught
+craft spells are keyed by spell id in either. Sanity join
+(`... FROM npc_trainer nt JOIN (SELECT DISTINCT spellid_2 FROM item_template WHERE class=9 AND spelltrigger_2=6) it ON nt.SpellID=it.spellid_2`):
+**173** craft spells are both trainer-listed and recipe-item-taught. Rarity rule: craft spell
+present in the trainer table → `TRAINER`; else recipe item in `npc_vendor` → `VENDOR`; else recipe
+item in any loot template → `DROP`; else `UNSOURCED` (treat as `DROP`). Prefer `trainer_spell`
+(current loader); keep `npc_trainer` as a fallback.
+
+### C-A5 — daily-cooldown recipes — **fields CONFIRMED; threshold check DEFERRED to C1**
+`SpellInfo` exposes `RecoveryTime` **:372** and `CategoryRecoveryTime` **:373** (ms), plus
+`GetRecoveryTime()` **:544** — `src/server/game/Spells/SpellInfo.h`. Structurally sufficient.
+The concrete `≥ 86 400 000 ms` (24 h) test is DBC-resident and cannot be read from `acore_world`
+offline (the item-side `spellcooldown_*` columns are the *learn* action, not the craft). **Deferred
+to a C1 startup log**, spot-checking known CD spells — Transmute: Arcanite **17187**, Titansteel
+Bar **55208**, Moonshroud **56002** — vs non-CD Smelt Copper **2657**, Bronze Bar **2660**, Bolt of
+Linen **2963**. **Design note:** transmutes use a *shared category* cooldown, so test
+`max(RecoveryTime, CategoryRecoveryTime) >= 86400000`, not `RecoveryTime` alone.
+
+### C-A6 — herb/ore nodes flow through the type-3 GO vector — **CONFIRMED**
+`GAMEOBJECT_TYPE_CHEST = 3` (`src/server/game/Miscellaneous/SharedDefines.h:1567`). Nodes are
+type-3 chests gated by a gather-skill lock, carrying a `Data1` loot id — so they already ride the
+base module's `Data1`/type-3 gameobject vector (base plan §2.2). Verified (`SELECT entry,name,type,Data0,Data1 FROM gameobject_template WHERE entry IN (...)`):
+Peacebloom 1618 → loot **1415**, Silverleaf 1617 → **1414**, Copper Vein 1731 → **1502**,
+Tin Vein 1732 → **1503**; TBC Felweed 181270 → 18111, WotLK Cobalt Deposit 189978 → 24153. Across
+the table `SELECT COUNT(*),SUM(Data1>0) FROM gameobject_template WHERE type=3` → **1349 / 1310**
+carry loot. Raw-mat supply for the craft layer already exists; no new GO query needed.
+
+### C-A7 — live bot listings iterable in-memory — **CONFIRMED**
+`AuctionHouseObject` (`src/server/game/AuctionHouse/AuctionHouseMgr.h:126`) holds
+`AuctionEntryMap _auctionsMap` (`std::map<uint32, AuctionEntry*>`, **:137,158**) exposed via
+`GetAuctions()` / `GetAuctionsBegin()/End()` **:141-143** — pure in-memory, no SQL. The base module
+already walks it (`BotAuctionCount`). `MarketAnchor` must build a **per-item median cache in one
+pass** over the neutral house per sell pass; never per-item queries.
+
+### C-A8 — skill-line ids — **CONFIRMED**
+`src/server/shared/SharedDefines.h`: First Aid 129 (**:3125**), Blacksmithing 164 (**:3142**),
+Leatherworking 165 (**:3143**), Alchemy 171 (**:3144**), Cooking 185 (**:3151**), Tailoring 197
+(**:3155**), Engineering 202 (**:3156**), Enchanting 333 (**:3187**), Jewelcrafting 755 (**:3218**),
+Inscription 773 (**:3235**). All ten match the spec's `SkillLine` table.
+
+### C-A9 — "Enchanting has no pre-WotLK listable product" — **CONTRADICTED (design correction)**
+False. Enchanting produces `SPELL_EFFECT_CREATE_ITEM` goods well before WotLK. Evidence
+(`SELECT entry,name,class,subclass,ItemLevel,RequiredSkill FROM item_template WHERE name IN (...)`):
+- **Wizard Oil** 20750 (ilvl 50, subclass 8), **Brilliant Mana Oil** 20748 (ilvl 55) — enchanting
+  oils; the latter is taught by Formula spell 25130 walked in C-A3.
+- **Runed Arcanite Rod** 16207 (ilvl 58) — enchanting-made rod (vanilla).
+The WotLK *scroll* mechanism rides **vellums** — Armor Vellum 38682 / Weapon Vellum 39349
+(`RequiredSkill = 333`, ilvl 1–65) — the enchant-on-vellum product is what is WotLK-only.
+**Correction:** do **not** blanket-exclude Enchanting pre-WotLK. Gate **SCROLL/vellum-enchant**
+products to expansion 2 (§5.1 `SCROLL` category); classify oils/rods/wands by their own product
+`ItemLevel`/recipe-source like any other craft. C-A9's sweep sentinel becomes "no *scroll* product
+below state 13," not "no enchanting product." Verify by scanning graph output in C1.
+
+### C-A10 — module-local seeded RNG is independent of core `urand` — **CONFIRMED**
+`urand`/`irand`/`frand`/`rand_norm` all draw from a single **file-local** `static RandomEngine engine;`
+(`src/common/Utilities/Random.cpp:25`, used at `:44` etc.); `RandomEngine` is the core's SFMT wrapper
+(`src/common/Utilities/Random.h:71`). A module-owned `std::mt19937` seeded from `Craft.Seed` shares no
+state with it. **Constraint #4:** route *all* craft-layer randomness through that one engine when
+seeded, and never call the core `urand` family from a seeded path (it would be unseeded and would also
+perturb core determinism).
+
+---
+
+## C0 deltas / design decisions carried forward
+
+- **C-A3:** direct `spelltrigger_2 == 6` → `spellid_2` resolver; exclude recipe subclass 0 (Books).
+  No `SPELL_EFFECT_LEARN_SPELL` walk. Trainer recipes have no item — resolve rarity via C-A4.
+- **C-A5:** CD test is `max(RecoveryTime, CategoryRecoveryTime) >= 86400000`; concrete spot-check
+  logged at C1 startup (spells 17187/55208/56002 CD; 2657/2660/2963 non-CD).
+- **C-A9:** Enchanting is gated at the **product** level, not the profession level; only
+  scroll/vellum products are expansion-2.
+- **C-A2:** citation is `PlayerUpdates.cpp`, not `Player.cpp`; formula otherwise as specified.
+
+## Still deferred to runtime (checked via C1 startup log / soak)
+- Per-profession × per-rarity graph counts; `MISC` category a minority (C1 acceptance).
+- CD-recipe detection spot-check (C-A5 spell ids above).
+- Enchanting product scan shows oils/rods at expansion 0/1 and scrolls only at expansion 2 (C-A9).
+- `Craft.Seed` determinism: identical seed+config+DB ⇒ identical `craft dump` (C1 deliverable).
