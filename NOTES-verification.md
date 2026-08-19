@@ -225,3 +225,47 @@ perturb core determinism).
 - CD-recipe detection spot-check (C-A5 spell ids above).
 - Enchanting product scan shows oils/rods at expansion 0/1 and scrolls only at expansion 2 (C-A9).
 - `Craft.Seed` determinism: identical seed+config+DB ⇒ identical `craft dump` (C1 deliverable).
+
+---
+
+# Phase C1 — runtime verification (recipe graph, live server)
+
+Built + installed the C1 binary, ran with `Craft.Enable=1 Craft.Seed=12345` against the
+live `acore_world` (2026-08-19). Startup log evidence:
+
+```
+recipe graph built — 2885 recipes in 0.12s (skipped: noReagent=0 product=239) cooldownRecipes=1
+per-profession x rarity (TRAINER/VENDOR/DROP/UNSOURCED):
+  Alchemy 75/33/52/33(193)  Blacksmithing 197/78/137/47(459)  Leatherworking 175/168/130/25(498)
+  Tailoring 173/93/107/29(402)  Engineering 131/39/60/22(252)  Enchanting 7/11/0/1(19)
+  Jewelcrafting 95/206/95/26(422)  Inscription 215/3/0/209(427)  Cooking 29/105/23/15(172)
+  First Aid 12/1/1/1(15)  Mining(smelt) 22/0/2/2(26)
+categories: FLASK=16 ELIXIR_POT=163 FOOD=172 BAG=42 GEM_CUT=293 SCROLL=0 AMMO=11 GEAR=1397 INTERMEDIATE=152 MISC=639
+CRAFT SELFTEST: PASS recipes=2885 available=1317 misc=639
+gate sweep state=0  maxExp=0 skill300 ilvl66  => available=1317 | JC=0   Inscription=0   GEM_CUT=0   GEAR=664  INTERMEDIATE=93
+gate sweep state=8  maxExp=1 skill375 ilvl115 => available=2045 | JC=393 Inscription=0   GEM_CUT=293 GEAR=981  INTERMEDIATE=136
+gate sweep state=13 maxExp=2 skill450 ilvl200 => available=2798 | JC=421 Inscription=427 GEM_CUT=293 GEAR=1312 INTERMEDIATE=152
+gate sweep state=18 maxExp=2 skill450 ilvl284 => available=2885 | JC=422 Inscription=427 GEM_CUT=293 GEAR=1397 INTERMEDIATE=152
+```
+
+**Acceptance met:** graph 0.12s (<5s); TRAINER dominates, UNSOURCED total ≈410 (low hundreds,
+mostly Inscription discovery recipes); MISC 639/2885 = 22 % (minority); JC/Inscription = 0 at
+state 0 and unlock at their era (JC→state 8, Inscription→state 13); available count monotone
+1317→2045→2798→2885; selftest PASS. Base module unchanged (`ready=true`, craft not wired into
+sell/buy).
+
+## C1 findings that adjust the C0 assumptions (carry into C4)
+
+- **C-A5 undercounts cooldown recipes (cooldownRecipes=1).** Transmutes / Titansteel / Moonshroud
+  carry their 24 h CD on the *spell category* cooldown store, not on `SpellInfo::RecoveryTime` /
+  `CategoryRecoveryTime` (both read 0 for them). Field-based detection catches only recipes with a
+  direct recovery time. **C4 fix (§4.5):** also consult the category-cooldown data
+  (`sSpellMgr` spell-category cooldowns / `SpellCategoryStore`) keyed by `SpellInfo::GetCategory()`.
+- **SCROLL category is empty (SCROLL=0) — enchant scrolls are not create-item spells.** The WotLK
+  vellum-scroll is produced by an `SPELL_EFFECT_ENCHANT_ITEM` spell applied to a vellum, so it never
+  appears in the `SPELL_EFFECT_CREATE_ITEM` scan. Enchanting's in-graph products are its create-item
+  goods (oils/rods, 19 recipes) — consistent with the C-A9 correction. **C4 decision needed:** either
+  model enchant-on-vellum as a synthetic recipe (vellum + dust reagents → scroll product) so the
+  `SCROLL:20` WotLK demand weight has supply, or drop the SCROLL category. Flagged, not yet resolved.
+- **Inscription UNSOURCED=209** are discovery/research-taught recipes (no trainer/vendor/loot row);
+  correctly treated as DROP for margins. Within the "low hundreds" tolerance (§2.2).
