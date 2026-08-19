@@ -2,6 +2,7 @@
 
 #include "CMangosAHBotCommon.h"
 #include "CMangosAHBotProgression.h"
+#include "CMangosAHBotRecipes.h"
 #include <functional>
 #include <string>
 #include <unordered_map>
@@ -45,6 +46,11 @@ public:
     std::string StatusReport() const;
     std::string ProgressionReport() const;
 
+    // Craft layer (crafting addendum). Graph is built only when Craft.Enable=1;
+    // with it off the module is behaviorally identical to the base seller/buyer.
+    std::string CraftStatusReport() const;
+    std::string CraftSelfTest() const;   // single "CRAFT SELFTEST: PASS|FAIL ..." line
+
 private:
     CMangosAHBot() = default;
 
@@ -58,6 +64,11 @@ private:
 
     uint8_t ExpansionOfMap(uint32_t mapId) const;
     uint8_t ExpansionOfArea(uint32_t areaId) const;
+
+    // One-shot craft-layer startup diagnostic (logs selftest + a per-era gating
+    // sweep). Cheap; only runs when the craft graph is built. Leaves the live mask
+    // as it found it.
+    void CraftStartupDiagnostics();
 
     // Simulation (Phase 4)
     void AddLootToItemMap(Player* bot, CmAHBItemMap& out);
@@ -114,6 +125,10 @@ private:
     uint32_t  _houseAction = 0;     // rotation 0..5
     bool      _ready = false;
     bool      _sourcesBuilt = false;
+
+    // Craft layer state (built lazily when Craft.Enable=1).
+    CMangosAHBotRecipeGraph _craftGraph;
+    bool _craftBuilt = false;
 };
 
 #define sCMangosAHBot CMangosAHBot::instance()

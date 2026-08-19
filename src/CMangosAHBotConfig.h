@@ -69,6 +69,44 @@ public:
     uint32_t progSkillCaps[3] = { 300, 375, 450 }; // per expansion 0/1/2
     bool     progExcludeUnspawned = true;
 
+    // -------- Craft layer (crafting addendum §8.1) --------
+    // C1 uses craftEnable + craftSeed; the rest are parsed now (constraint #9) and
+    // consumed by later phases. Complex strings (SkillDist, Demand*, StateBoost) are
+    // stored raw and parsed where used (C3/C4).
+    uint32_t craftEnable       = 0;
+    uint32_t craftSeed         = 0;   // 0 = nondeterministic; nonzero = reproducible
+    uint32_t craftPopulation   = 120;
+    uint32_t craftSessionsMin  = 4;
+    uint32_t craftSessionsMax  = 8;
+    uint32_t craftChance       = 100;
+    int32_t  craftLevelingShare = -1; // -1 = derive from skill distribution
+    std::string craftProfessionWeights;
+    std::string craftSkillDist;
+    uint32_t craftBatchLevelingMin = 5;
+    uint32_t craftBatchLevelingMax = 15;
+    uint32_t craftGearWindow   = 26;
+
+    uint32_t craftMarginLevelingMin = 70,  craftMarginLevelingMax = 95;
+    uint32_t craftMarginTrainerMin  = 100, craftMarginTrainerMax  = 125;
+    uint32_t craftMarginVendorMin   = 110, craftMarginVendorMax   = 140;
+    uint32_t craftMarginDropMin     = 150, craftMarginDropMax     = 300;
+    uint32_t craftMarginCooldownBonus = 150;
+    float    craftCooldownPerCrafter  = 1.0f;
+
+    uint32_t craftAnchorClampMin = 50;   // % of intrinsic
+    uint32_t craftAnchorClampMax = 300;
+
+    uint32_t craftBuyDailyCap    = 20;
+    uint32_t craftBuyFloorMult   = 30;   // % valuation floor past 3x cap
+    uint32_t craftLedgerWindowHours = 24;
+
+    std::string craftDemandVanilla;
+    std::string craftDemandTbc;
+    std::string craftDemandWotlk;
+    std::string craftDemandStateBoost;
+
+    uint32_t craftTestCommands = 0;      // gate for `craft testlist` (§8.3 / §10.4)
+
     // Helpers
     std::vector<uint32_t> ExcludedAccountList() const;
 
@@ -76,6 +114,7 @@ private:
     static CmAHBSourceConfig ParseTuple(const std::string& key, const char* def);
     static void ParseValueRow(const std::string& key, uint32_t out[CMAHB_MAX_CLASS], const char* def);
     static void ParseUIntList(const std::string& raw, uint32_t* out, size_t n);
+    static void ParseUIntPair(const std::string& key, const char* def, uint32_t& a, uint32_t& b);
 };
 
 extern CMangosAHBotConfig gCMangosAHBotConfig;

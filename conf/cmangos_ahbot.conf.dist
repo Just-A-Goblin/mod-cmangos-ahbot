@@ -120,3 +120,78 @@ CMangosAHBot.Progression.SkillCaps       = 300,375,450
 # Exclude loot sources with no spawn row (unresolvable map). Recommended 1;
 # including them lets instance-summoned adds leak into the wrong era.
 CMangosAHBot.Progression.ExcludeUnspawned = 1
+
+########################################
+# Craft layer (crafting addendum). A parallel generator that simulates crafters:
+# a virtual population runs crafting sessions each sell pass, dumping leveling
+# output below cost and producing demand-weighted goods at cost x margin. Gated
+# by the SAME progression machinery as the loot sim. With Craft.Enable = 0 the
+# module is behaviorally identical to the base loot-simulation seller/buyer.
+#
+# When Craft.Enable = 1 the flat Items.Profession source is retired (it produces
+# uniform noise); do not run both as listing producers.
+########################################
+
+CMangosAHBot.Craft.Enable            = 0
+
+# 0 = nondeterministic (std::random_device). Nonzero = reproducible: identical
+# seed + config + DB gives an identical `craft dump`. Uses a module-local RNG
+# entirely separate from the core's urand — it never perturbs core determinism.
+CMangosAHBot.Craft.Seed              = 0
+
+# Virtual crafter population and how it splits across production professions
+# (skillLineId:weight). The distribution, not the individuals, is the model —
+# the population is re-rolled from Craft.SkillDist on every restart.
+CMangosAHBot.Craft.Population        = 120
+CMangosAHBot.Craft.ProfessionWeights = "171:20,164:12,165:12,197:15,202:10,333:10,755:10,773:6,185:3,129:2"
+
+# Beta shape params per progression state: "state:alpha:beta,...". Early states
+# spread skill across 1..cap (fresh-server intermediate glut); late states mass
+# at cap. Empty = a sane built-in default (parsed in C3).
+CMangosAHBot.Craft.SkillDist         = ""
+
+# Sessions run per sell pass (after TickCompensation), and the % chance each runs.
+CMangosAHBot.Craft.Sessions          = 4, 8
+CMangosAHBot.Craft.Chance            = 100
+
+# Fraction of sessions drawn from below-cap (leveling) crafters. -1 = derive from
+# the skill distribution.
+CMangosAHBot.Craft.LevelingShare     = -1
+
+# Leveling batch size, and the ilvl window below the cap in which GEAR is demanded.
+CMangosAHBot.Craft.Batch.Leveling    = 5, 15
+CMangosAHBot.Craft.GearWindow        = 26
+
+# Margins (min,max % of material cost). Leveling dumps below cost ON PURPOSE — it
+# is what makes the AH the cheap place to buy bars and bolts, exactly like live.
+CMangosAHBot.Craft.Margin.Leveling      = 70, 95
+CMangosAHBot.Craft.Margin.Trainer       = 100, 125
+CMangosAHBot.Craft.Margin.Vendor        = 110, 140
+CMangosAHBot.Craft.Margin.Drop          = 150, 300
+CMangosAHBot.Craft.Margin.CooldownBonus = 150     # extra x for daily-cooldown products
+CMangosAHBot.Craft.CooldownPerCrafter   = 1.0     # daily output per crafter for CD recipes
+
+# Market anchor clamp: crafted prices track live mat prices but are clamped to
+# [min,max] % of the intrinsic vendor-anchored formula, so a mat squeeze/dump
+# cannot distort the whole crafted price sheet.
+CMangosAHBot.Craft.AnchorClampMin    = 50
+CMangosAHBot.Craft.AnchorClampMax    = 300
+
+# Demand ledger / buyer: units per item bought at full valuation before the
+# saturation curve decays toward FloorMult% (dump 100 flasks -> price crashes).
+CMangosAHBot.Craft.Buy.DailyCap      = 20
+CMangosAHBot.Craft.Buy.FloorMult     = 30
+CMangosAHBot.Craft.Ledger.WindowHours= 24
+
+# Category demand weights per era (category:weight). Categories: FLASK, ELIXIR_POT,
+# FOOD, BAG, GEM_CUT, SCROLL, AMMO, GEAR, INTERMEDIATE, MISC. The item mix is
+# emergent — no individual item is ever named here.
+CMangosAHBot.Craft.Demand.Vanilla    = "FLASK:20,ELIXIR_POT:30,FOOD:25,BAG:10,AMMO:25,GEAR:15,INTERMEDIATE:8,MISC:1"
+CMangosAHBot.Craft.Demand.Tbc        = "FLASK:35,ELIXIR_POT:25,FOOD:25,GEM_CUT:30,BAG:10,GEAR:20,INTERMEDIATE:8,MISC:1"
+CMangosAHBot.Craft.Demand.Wotlk      = "FLASK:40,ELIXIR_POT:15,FOOD:30,GEM_CUT:35,SCROLL:20,BAG:12,GEAR:20,INTERMEDIATE:8,MISC:1"
+# Sparse per-state category multipliers, "state:CATEGORY:mult,..." e.g. "4:ELIXIR_POT:180,7:GEAR:150".
+CMangosAHBot.Craft.Demand.StateBoost = ""
+
+# Gate for `.cmahbot craft testlist` (creates synthetic non-bot auctions for the
+# buyer test harness). Leave 0 in production.
+CMangosAHBot.Craft.TestCommands      = 0

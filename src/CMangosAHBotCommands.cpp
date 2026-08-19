@@ -41,7 +41,8 @@ public:
         if (!sub)
         {
             handler->SendSysMessage("cmahbot: status | reload | rebuild [ally|horde|neutral] | "
-                                    "progression [refresh] | item <id> <value> <chance> <min> <max> | item reset <id>");
+                                    "progression [refresh] | craft <status|selftest> | "
+                                    "item <id> <value> <chance> <min> <max> | item reset <id>");
             return true;
         }
         size_t l = strlen(sub);
@@ -70,6 +71,19 @@ public:
                 return true;
             }
             SendMultiline(handler, sCMangosAHBot->ProgressionReport());
+            return true;
+        }
+
+        if (strncmp(sub, "craft", l) == 0)
+        {
+            char* p2 = strtok(nullptr, " ");
+            if (p2 && strncmp(p2, "selftest", strlen(p2)) == 0)
+            {
+                handler->SendSysMessage(sCMangosAHBot->CraftSelfTest().c_str());
+                return true;
+            }
+            // default: craft status
+            SendMultiline(handler, sCMangosAHBot->CraftStatusReport());
             return true;
         }
 

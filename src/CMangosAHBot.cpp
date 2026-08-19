@@ -8,6 +8,7 @@
  */
 #include "CMangosAHBot.h"
 #include "CMangosAHBotConfig.h"
+#include "CMangosAHBotRng.h"
 #include "AuctionHouseMgr.h"
 #include "AuctionHouseSearcher.h"
 #include "DatabaseEnv.h"
@@ -109,7 +110,22 @@ void CMangosAHBot::Initialize()
         _sourcesBuilt = true;
     }
 
-    RefreshProgression(true); // sets caps, builds filtered vectors, logs sizes
+    // Craft layer (crafting addendum): build the recipe graph once, before the first
+    // progression refresh so its availability mask is computed with the initial caps.
+    // Gated on Craft.Enable — with it off, none of this runs and the seller/buyer path
+    // is byte-for-byte the base module (constraint #1).
+    if (cfg.craftEnable && !_craftBuilt)
+    {
+        sCMangosAHBotRng->Seed(cfg.craftSeed);
+        _craftGraph.Build(cfg, _vendorItems);
+        _craftBuilt = true;
+        // The legacy Items.Profession source stays active until craft sessions produce
+        // listings (C3); only then is it retired (double-listing guard). Note it here.
+        LOG_INFO("module", "CMangosAHBot[craft]: graph ready (seed={}). Legacy Items.Profession "
+                 "path remains active until craft production lands (C3).", sCMangosAHBotRng->Seeded());
+    }
+
+    RefreshProgression(true); // sets caps, builds filtered vectors, logs sizes, masks craft graph
 
     // Guardrail (plan §6): a critical empty vector means a source contributes nothing.
     bool anyEmpty = _creature[0].empty() || _fishing.empty() || _gameobject.empty() ||
@@ -128,6 +144,41 @@ void CMangosAHBot::Initialize()
     LOG_INFO("module", "CMangosAHBot: initialized (ready={} state={} maxExp={} ilvlCap={}).",
              _ready, _caps.state, _caps.maxExpansion,
              _caps.itemLevelCap == NOCAP ? 0 : _caps.itemLevelCap);
+
+    if (_craftBuilt)
+        CraftStartupDiagnostics();
+}
+
+void CMangosAHBot::CraftStartupDiagnostics()
+{
+    const auto& cfg = gCMangosAHBotConfig;
+
+    // Selftest at the live state.
+    LOG_INFO("module", "CMangosAHBot[craft]: {}", CraftSelfTest());
+
+    // Per-era gating sweep: re-mask the graph for a handful of probe states and log
+    // how availability (and the era-marker categories/skills) unlocks. Restored to
+    // the live caps afterwards so runtime behavior is unchanged.
+    const uint8_t probes[] = { 0, static_cast<uint8_t>(cfg.progTbcAtState),
+                               static_cast<uint8_t>(cfg.progWotlkAtState), 18 };
+    for (uint8_t s : probes)
+    {
+        CmAHBCaps c = CMangosAHBotProgression::CapsForState(s);
+        _craftGraph.RecomputeMask(c, cfg.progTbcAtState, cfg.progWotlkAtState, cfg.progSkillCaps);
+        LOG_INFO("module", "CMangosAHBot[craft]: gate sweep state={} maxExp={} skillCap={} ilvlCap={} "
+                 "=> available={}/{} | JC={} Inscription={} GEM_CUT={} SCROLL={} GEAR={} INTERMEDIATE={}",
+                 int(s), int(c.maxExpansion), c.skillCap == NOCAP ? 0 : c.skillCap,
+                 c.itemLevelCap == NOCAP ? 0 : c.itemLevelCap,
+                 _craftGraph.AvailableCount(), _craftGraph.Size(),
+                 _craftGraph.SkillLineAvailableCount(SKILL_JEWELCRAFTING),
+                 _craftGraph.SkillLineAvailableCount(SKILL_INSCRIPTION),
+                 _craftGraph.CategoryCount(CAT_GEM_CUT, true),
+                 _craftGraph.CategoryCount(CAT_SCROLL, true),
+                 _craftGraph.CategoryCount(CAT_GEAR, true),
+                 _craftGraph.CategoryCount(CAT_INTERMEDIATE, true));
+    }
+    // Restore the live mask.
+    _craftGraph.RecomputeMask(_caps, cfg.progTbcAtState, cfg.progWotlkAtState, cfg.progSkillCaps);
 }
 
 void CMangosAHBot::ReloadData()
@@ -423,6 +474,14 @@ void CMangosAHBot::RefreshProgression(bool force)
         uint8_t oldState = _caps.state;
         _caps = newCaps;
         RebuildFilteredVectors();
+        if (_craftBuilt)
+        {
+            _craftGraph.RecomputeMask(_caps, cfg.progTbcAtState, cfg.progWotlkAtState, cfg.progSkillCaps);
+            LOG_INFO("module", "CMangosAHBot[craft]: mask recomputed for state {} — available {}/{} recipes "
+                     "(JC={} Inscription={}).", _caps.state, _craftGraph.AvailableCount(), _craftGraph.Size(),
+                     _craftGraph.SkillLineAvailableCount(SKILL_JEWELCRAFTING),
+                     _craftGraph.SkillLineAvailableCount(SKILL_INSCRIPTION));
+        }
         LOG_INFO("module", "CMangosAHBot: progression {} -> {} (maxExp={} ilvlCap={} skillCap={}). "
             "Vectors: creN={} creR={} creE={} creRE={} creWB={} go={} fish={} skin={} disen={} prof={}",
             firstRun ? 0 : oldState, _caps.state, _caps.maxExpansion,
@@ -911,6 +970,24 @@ std::string CMangosAHBot::StatusReport() const
        << " layer3Dropped=" << _layer3Dropped
        << " | auctions A/H/N=" << BotAuctionCount(0) << "/" << BotAuctionCount(1) << "/" << BotAuctionCount(2);
     return ss.str();
+}
+
+std::string CMangosAHBot::CraftStatusReport() const
+{
+    if (!gCMangosAHBotConfig.craftEnable || !_craftBuilt)
+        return "Craft layer disabled (Craft.Enable=0).";
+    return _craftGraph.StatusReport(_caps);
+}
+
+std::string CMangosAHBot::CraftSelfTest() const
+{
+    if (!gCMangosAHBotConfig.craftEnable || !_craftBuilt)
+        return "CRAFT SELFTEST: FAIL craft layer disabled (Craft.Enable=0)";
+    const auto& cfg = gCMangosAHBotConfig;
+    std::string detail;
+    bool ok = _craftGraph.SelfTest(_caps, cfg.progTbcAtState, cfg.progWotlkAtState,
+                                   cfg.progSkillCaps, detail);
+    return std::string("CRAFT SELFTEST: ") + (ok ? "PASS " : "FAIL ") + detail;
 }
 
 std::string CMangosAHBot::ProgressionReport() const

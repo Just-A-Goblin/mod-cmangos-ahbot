@@ -39,6 +39,20 @@ void CMangosAHBotConfig::ParseUIntList(const std::string& raw, uint32_t* out, si
     }
 }
 
+void CMangosAHBotConfig::ParseUIntPair(const std::string& key, const char* def, uint32_t& a, uint32_t& b)
+{
+    std::string raw = sConfigMgr->GetOption<std::string>(key, def);
+    std::istringstream ss(raw);
+    std::string tok;
+    uint32_t v[2] = { a, b };
+    for (int i = 0; i < 2 && std::getline(ss, tok, ','); ++i)
+    {
+        try { v[i] = static_cast<uint32_t>(std::stoul(tok)); } catch (...) {}
+    }
+    a = v[0];
+    b = std::max(v[0], v[1]);
+}
+
 std::vector<uint32_t> CMangosAHBotConfig::ExcludedAccountList() const
 {
     std::vector<uint32_t> ids;
@@ -134,6 +148,43 @@ void CMangosAHBotConfig::Load()
         ParseUIntList(raw, progSkillCaps, 3);
     }
 
-    LOG_INFO("module", "CMangosAHBot: config loaded (enable={} account={} guid={} progression={}/src{} tickComp={})",
-        enable, account, guid, progEnable, progSource, tickCompensation);
+    // -------- Craft layer (crafting addendum §8.1) --------
+    craftEnable     = sConfigMgr->GetOption<uint32_t>("CMangosAHBot.Craft.Enable", 0);
+    craftSeed       = sConfigMgr->GetOption<uint32_t>("CMangosAHBot.Craft.Seed", 0);
+    craftPopulation = sConfigMgr->GetOption<uint32_t>("CMangosAHBot.Craft.Population", 120);
+    ParseUIntPair("CMangosAHBot.Craft.Sessions", "4,8", craftSessionsMin, craftSessionsMax);
+    craftChance     = sConfigMgr->GetOption<uint32_t>("CMangosAHBot.Craft.Chance", 100);
+    craftLevelingShare = sConfigMgr->GetOption<int32_t>("CMangosAHBot.Craft.LevelingShare", -1);
+    craftProfessionWeights = sConfigMgr->GetOption<std::string>("CMangosAHBot.Craft.ProfessionWeights",
+        "171:20,164:12,165:12,197:15,202:10,333:10,755:10,773:6,185:3,129:2");
+    craftSkillDist  = sConfigMgr->GetOption<std::string>("CMangosAHBot.Craft.SkillDist", "");
+    ParseUIntPair("CMangosAHBot.Craft.Batch.Leveling", "5,15", craftBatchLevelingMin, craftBatchLevelingMax);
+    craftGearWindow = sConfigMgr->GetOption<uint32_t>("CMangosAHBot.Craft.GearWindow", 26);
+
+    ParseUIntPair("CMangosAHBot.Craft.Margin.Leveling", "70,95",   craftMarginLevelingMin, craftMarginLevelingMax);
+    ParseUIntPair("CMangosAHBot.Craft.Margin.Trainer",  "100,125", craftMarginTrainerMin,  craftMarginTrainerMax);
+    ParseUIntPair("CMangosAHBot.Craft.Margin.Vendor",   "110,140", craftMarginVendorMin,   craftMarginVendorMax);
+    ParseUIntPair("CMangosAHBot.Craft.Margin.Drop",     "150,300", craftMarginDropMin,     craftMarginDropMax);
+    craftMarginCooldownBonus = sConfigMgr->GetOption<uint32_t>("CMangosAHBot.Craft.Margin.CooldownBonus", 150);
+    craftCooldownPerCrafter  = sConfigMgr->GetOption<float>("CMangosAHBot.Craft.CooldownPerCrafter", 1.0f);
+
+    craftAnchorClampMin = sConfigMgr->GetOption<uint32_t>("CMangosAHBot.Craft.AnchorClampMin", 50);
+    craftAnchorClampMax = sConfigMgr->GetOption<uint32_t>("CMangosAHBot.Craft.AnchorClampMax", 300);
+
+    craftBuyDailyCap    = sConfigMgr->GetOption<uint32_t>("CMangosAHBot.Craft.Buy.DailyCap", 20);
+    craftBuyFloorMult   = sConfigMgr->GetOption<uint32_t>("CMangosAHBot.Craft.Buy.FloorMult", 30);
+    craftLedgerWindowHours = sConfigMgr->GetOption<uint32_t>("CMangosAHBot.Craft.Ledger.WindowHours", 24);
+
+    craftDemandVanilla = sConfigMgr->GetOption<std::string>("CMangosAHBot.Craft.Demand.Vanilla",
+        "FLASK:20,ELIXIR_POT:30,FOOD:25,BAG:10,AMMO:25,GEAR:15,INTERMEDIATE:8,MISC:1");
+    craftDemandTbc     = sConfigMgr->GetOption<std::string>("CMangosAHBot.Craft.Demand.Tbc",
+        "FLASK:35,ELIXIR_POT:25,FOOD:25,GEM_CUT:30,BAG:10,GEAR:20,INTERMEDIATE:8,MISC:1");
+    craftDemandWotlk   = sConfigMgr->GetOption<std::string>("CMangosAHBot.Craft.Demand.Wotlk",
+        "FLASK:40,ELIXIR_POT:15,FOOD:30,GEM_CUT:35,SCROLL:20,BAG:12,GEAR:20,INTERMEDIATE:8,MISC:1");
+    craftDemandStateBoost = sConfigMgr->GetOption<std::string>("CMangosAHBot.Craft.Demand.StateBoost", "");
+
+    craftTestCommands = sConfigMgr->GetOption<uint32_t>("CMangosAHBot.Craft.TestCommands", 0);
+
+    LOG_INFO("module", "CMangosAHBot: config loaded (enable={} account={} guid={} progression={}/src{} tickComp={} craft={}/seed{})",
+        enable, account, guid, progEnable, progSource, tickCompensation, craftEnable, craftSeed);
 }
