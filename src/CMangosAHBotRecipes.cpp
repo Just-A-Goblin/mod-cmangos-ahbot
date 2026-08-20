@@ -336,7 +336,8 @@ void CMangosAHBotRecipeGraph::Build(const CMangosAHBotConfig& cfg,
     LOG_INFO("module", "CMangosAHBot[craft]: recipe graph built — {} recipes in {:.2f}s "
              "(skipped: noReagent={} product={}) cooldownRecipes={}",
              _recipes.size(), _buildSeconds, _skippedNoReagent, _skippedProduct, _cooldownCount);
-    SendGraphReport();
+    if (cfg.craftDiagnostics) // per-profession x rarity + category histogram (verbose)
+        SendGraphReport();
 }
 
 void CMangosAHBotRecipeGraph::SendGraphReport() const

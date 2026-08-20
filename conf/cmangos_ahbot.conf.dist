@@ -204,6 +204,12 @@ CMangosAHBot.Craft.Demand.StateBoost = ""
 # buyer test harness). Leave 0 in production.
 CMangosAHBot.Craft.TestCommands      = 0
 
+# 1 = log the verbose startup diagnostics block (gate sweep, cost hand-check, leveling
+# sim, demand sweep, texture sample, timing bench, sentinel scans). Handy for tuning/
+# validation; leave 0 for quiet production startups. The concise one-line startup logs
+# (graph size, population, progression) are always shown.
+CMangosAHBot.Craft.Diagnostics       = 0
+
 # If set, the module writes a simulated craft-dump CSV (item,category,rarity,stack,
 # unit_price,unit_matcost,ratio,leveling) to this path at startup — used by the
 # tools/craft-soak sweep driver. Leave empty in production.

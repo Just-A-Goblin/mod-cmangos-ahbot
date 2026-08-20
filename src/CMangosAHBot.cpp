@@ -157,7 +157,14 @@ void CMangosAHBot::Initialize()
              _caps.itemLevelCap == NOCAP ? 0 : _caps.itemLevelCap);
 
     if (_craftBuilt)
-        CraftStartupDiagnostics();
+    {
+        // Verbose diagnostics only when explicitly enabled (quiet production startups).
+        if (cfg.craftDiagnostics)
+            CraftStartupDiagnostics();
+        // The soak-driver CSV dump is independent of the diagnostics flag.
+        if (!cfg.craftDumpFile.empty())
+            LOG_INFO("module", "CMangosAHBot[craft]: {}", CraftDump(cfg.craftDumpFile, /*liveAH=*/false));
+    }
 }
 
 void CMangosAHBot::CraftStartupDiagnostics()
@@ -277,10 +284,9 @@ void CMangosAHBot::CraftStartupDiagnostics()
     // C6 hand-check: stack/price-point texture per category.
     CraftTextureSample();
 
-    // C7: per-pass timing budget, and (for the soak driver) a craft-dump CSV.
+    // C7: per-pass timing budget. (The soak-driver CSV dump lives in Initialize now,
+    // so it stays available even with Craft.Diagnostics off.)
     CraftTimingBench();
-    if (!cfg.craftDumpFile.empty())
-        LOG_INFO("module", "CMangosAHBot[craft]: {}", CraftDump(cfg.craftDumpFile, /*liveAH=*/false));
 
     // C5 hand-check: buyer (ledger buy + saturation). Gated by Craft.TestCommands
     // (mutates the AH with synthetic auctions, then cleans up).

@@ -110,6 +110,7 @@ public:
     std::string craftDemandStateBoost;
 
     uint32_t craftTestCommands = 0;      // gate for `craft testlist` (§8.3 / §10.4)
+    uint32_t craftDiagnostics  = 0;      // 1 = log the verbose startup diagnostics block
     std::string craftDumpFile;           // if set, write a sim craft-dump CSV at startup (C7 sweep)
 
     // Helpers
