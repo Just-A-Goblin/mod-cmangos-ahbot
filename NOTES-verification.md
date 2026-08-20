@@ -269,3 +269,43 @@ sell/buy).
   `SCROLL:20` WotLK demand weight has supply, or drop the SCROLL category. Flagged, not yet resolved.
 - **Inscription UNSOURCED=209** are discovery/research-taught recipes (no trainer/vendor/loot row);
   correctly treated as DROP for margins. Within the "low hundreds" tolerance (§2.2).
+
+---
+
+# Phase C2 — cost engine verification
+
+**Offline (`tools/craft-tests/`, the "green before C2" gate):** `CRAFT-TESTS: PASS (22 passed,
+0 failed)`. Asserts min(market,make) both directions, multi-output division, transmute-cycle
+termination + fallback + `cycleHits>0` + zero depth hits, deep epic chain, margin + cooldown-bonus
+math, memoization stability, `NewPass` reset. The engine links with **no core headers** (facade
+constraint #3 satisfied).
+
+**In-server hand-check (live graph, state 0, seed 12345; anchor medians from 2127 live bot listings):**
+```
+bar<-ore : Copper Bar x1 <= Copper Ore x1@19                        | cost/unit=19    (1*19 ✓)
+bolt<-cloth: Bolt of Linen x1 <= Linen Cloth x2@56                  | cost/unit=112   (2*56 ✓)
+flask<-herb: Flask of the Titans x2 <= Gromsblood x30@990 + Stonescale Oil x10@102
+             + Black Lotus x1@4000 + Crystal Vial x1@500            | cost/unit=17610 ((29700+1020+4000+500)/2 ✓)
+epic-gear : White Leather Jerkin x1 <= Light Leather x8@91 + Coarse Thread x2@10 + Bleach x1@25
+                                                                    | cost/unit=773   (728+20+25 ✓)
+full-graph cost pass — priced 1317 products, cycleHits=1 depthHits=0 memo=1745   (no blowups, cycle bounded)
+```
+Every price reduces to Σ(MatValue×count)/productCount, multi-output `/2` correct on real data, the
+one graph cycle is detected and bounded, no recursion blowups over all 1317 available products, no
+crashes. **C2 acceptance met.**
+
+## C2 finding — gating leak (assign to C4)
+
+The `[CD]` sample surfaced **Glacial Bag (WotLK, 22-slot) available at `state 0`.** Root cause: BAG
+(and consumable) categories are exempt from the ilvl mask (§2.3 rule 4); when such a recipe's
+crafting spell has `MinSkillLineRank = 0` (requirement enforced elsewhere) the skill-rank era-bake
+(rule 2) also misses it, and it is neither JC nor Inscription (rule 1) — so it bakes to expansion 0.
+The deferred **rule 3 (recipe-source drop map)** is exactly what would catch it. **C4 must fix** —
+its `Netherweave Bag pre-state-8` sentinel enforces this. Candidate fix: also bake
+`recipe.expansion = max(reagent eras)` (a bag using Moonshroud is WotLK) and/or resolve the recipe
+item's drop-source map. Cost math is unaffected; this is a mask bug only.
+
+Secondary note: smelting spells (Smelt Copper etc.) classify **UNSOURCED** (their craft spell id is
+not in `trainer_spell`), so bars carry DROP production margins — but bars are overwhelmingly
+leveling-dumped (LevelingMargin), so the production margin rarely applies. Revisit in C3/C4 if bar
+pricing looks off.
