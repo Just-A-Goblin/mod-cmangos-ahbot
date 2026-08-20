@@ -76,12 +76,15 @@ namespace CraftSim
     // with §2.3): 300 below tbcAt, 375 below wotlkAt, else 450.
     uint16_t CapForState(uint8_t state, uint32_t tbcAt, uint32_t wotlkAt);
 
-    // Roll the population (§4.1/§4.2): distribute `size` crafters across professions
-    // by weight, skill = cap * Beta(alpha,beta). `weights` is (skillLine, weight).
+    // Roll the population (§4.1/§4.2): distribute `size` crafters across professions by
+    // weight. `atCapFraction` of them are established max crafters (skill = cap → they
+    // PRODUCE, §5); the rest are levelers whose skill = 1 + Beta*(cap-1), strictly below
+    // cap (§4.4 glut). A continuous Beta almost never hits cap on its own, so this
+    // explicit at-cap mass is what makes production actually run in live operation.
     std::vector<Crafter> RollPopulation(uint32_t size,
                                         const std::vector<std::pair<uint32_t, uint32_t>>& weights,
                                         uint16_t cap, double alpha, double beta,
-                                        std::mt19937& rng);
+                                        double atCapFraction, std::mt19937& rng);
 
     // Production recipe choice (§5.2): weight = CategoryWeight(era) * ilvlWindow(GEAR)
     // * stateBoost * overrideWeight, sampled proportionally among the crafter's

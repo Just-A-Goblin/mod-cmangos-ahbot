@@ -244,7 +244,7 @@ namespace CraftSim
     std::vector<Crafter> RollPopulation(uint32_t size,
                                         const std::vector<std::pair<uint32_t, uint32_t>>& weights,
                                         uint16_t cap, double alpha, double beta,
-                                        std::mt19937& rng)
+                                        double atCapFraction, std::mt19937& rng)
     {
         std::vector<Crafter> pop;
         if (weights.empty() || size == 0)
@@ -257,7 +257,11 @@ namespace CraftSim
         if (wsum == 0)
             return pop;
 
+        if (atCapFraction < 0.0) atCapFraction = 0.0;
+        if (atCapFraction > 1.0) atCapFraction = 1.0;
+
         std::uniform_int_distribution<uint32_t> wpick(0, wsum - 1);
+        std::uniform_real_distribution<double> u01(0.0, 1.0);
         // Beta(a,b) = X/(X+Y), X~Gamma(a,1), Y~Gamma(b,1).
         std::gamma_distribution<double> ga(alpha, 1.0), gb(beta, 1.0);
 
@@ -269,11 +273,22 @@ namespace CraftSim
                 acc += w;
                 if (pickv < acc) { sl = wsl; break; }
             }
-            double x = ga(rng), y = gb(rng);
-            double frac = (x + y > 0.0) ? x / (x + y) : 0.5;
-            uint16_t skill = static_cast<uint16_t>(std::lround(frac * cap));
-            if (skill < 1)   skill = 1;
-            if (skill > cap) skill = cap;
+
+            uint16_t skill;
+            if (u01(rng) < atCapFraction)
+            {
+                skill = cap; // established max crafter -> produces (§5)
+            }
+            else
+            {
+                // Leveler: skill in [1, cap-1], strictly below cap (§4.4 glut).
+                double x = ga(rng), y = gb(rng);
+                double frac = (x + y > 0.0) ? x / (x + y) : 0.5;
+                uint16_t maxLevel = cap > 1 ? uint16_t(cap - 1) : 1;
+                skill = static_cast<uint16_t>(std::lround(frac * maxLevel));
+                if (skill < 1)        skill = 1;
+                if (skill > maxLevel) skill = maxLevel;
+            }
             pop.push_back(Crafter{ sl, skill, cap });
         }
         return pop;

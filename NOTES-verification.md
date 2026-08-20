@@ -494,3 +494,21 @@ treatment of equilibrium (there is no stock cap — expiry is the sink).
 **Tuning notes (carried, not blockers):** ammo over-dominates *unit* counts (high `productCount`) though
 its *listing* share is weight-correct; CD detection stays ≈1 recipe (real `Spell.dbc` dailies aren't on
 the create-item spell — documented in C4); both are config-tunable and do not affect correctness.
+
+---
+
+# Post-deploy fix — production layer never activated in live operation
+
+Found during test-server spot-checking (**no craftable bags on the AH**). Root cause: the population
+sampled `skill = cap × Beta(α,β)`, and a continuous Beta essentially never lands *exactly* on `cap`, so
+`leveling()` (`skill < cap`) was true for **every** crafter (`below-cap = 120/120`). Since production
+(§5: bags, flasks, cut gems, gear) only runs for **at-cap** crafters, production **never ran** in live
+operation — only leveling output (bars/bolts/bandages/greens/ammo) reached the AH. The C4/C5 verifications
+masked this because they *forced* all-at-cap populations for the sweep/buyer tests.
+
+Fix: `RollPopulation` now takes an explicit **`atCapFraction`** — that fraction are established max
+crafters (`skill = cap` ⇒ produce), the rest are levelers (`skill ∈ [1, cap-1]`, the glut). Default
+derives a state-scaled `0.40 + 0.02·state` (clamped to 0.85), overridable via `Craft.LevelingShare`
+(percent leveling). An established server (many level-60 crafters) thus produces bags/flasks/gems/gear
+*alongside* the leveling glut. Verified: `leveling=70 producers=50`; live sim now shows `BAG`, `FLASK`,
+`ELIXIR_POT`, `FOOD`, `GEAR` present (were 0). Offline 57/57.

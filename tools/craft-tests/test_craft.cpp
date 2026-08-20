@@ -267,18 +267,22 @@ int main()
     Crafter atGrey{171, 150, 300};
     checkEq(CraftSim::SimulateSkillUps(atGrey, cheapBar, 100, chances, rng), 0, "no skill-ups past grey");
 
-    // 17. Population roll: right size, skills in [1,cap], professions from weights.
-    auto pop = CraftSim::RollPopulation(500, {{171,3},{164,1}}, 300, 2.0, 3.0, rng);
+    // 17. Population roll: right size, skills in [1,cap], professions from weights,
+    //     and BOTH levelers and at-cap producers exist (atCapFraction=0.4).
+    auto pop = CraftSim::RollPopulation(500, {{171,3},{164,1}}, 300, 2.0, 3.0, 0.4, rng);
     checkEq((uint64_t)pop.size(), 500, "population size honored");
-    bool skillsOk=true, profOk=true; uint32_t below=0;
+    bool skillsOk=true, profOk=true; uint32_t below=0, atcap=0;
     for (auto& c : pop) {
         if (c.skill < 1 || c.skill > 300) skillsOk=false;
         if (c.skillLine!=171 && c.skillLine!=164) profOk=false;
-        if (c.leveling()) ++below;
+        if (c.leveling()) ++below; else ++atcap;
     }
     check(skillsOk, "all skills within [1,cap]");
     check(profOk, "all professions from the weight table");
-    check(below > 0, "a fresh (state-0) population has below-cap levelers");
+    check(below > 0, "population has below-cap levelers (the glut)");
+    check(atcap > 0, "population has at-cap producers (bags/flasks/gems)");
+    // ~40% should be at cap; allow slack for the RNG.
+    check(atcap > 500*0.25 && atcap < 500*0.55, "at-cap producer fraction ~= 0.4");
 
     // 18. Production chooser (§5.2): category weights steer selection; GEAR ilvl
     //     window gates; override weight 0 forbids.

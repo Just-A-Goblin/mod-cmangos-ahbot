@@ -841,7 +841,7 @@ void CMangosAHBot::CraftDemandSweep()
 
         uint16_t cap = CraftSim::CapForState(st, cfg.progTbcAtState, cfg.progWotlkAtState);
         auto weights = ParseWeights(cfg.craftProfessionWeights);
-        auto pop = CraftSim::RollPopulation(cfg.craftPopulation, weights, cap, 5.0, 1.2,
+        auto pop = CraftSim::RollPopulation(cfg.craftPopulation, weights, cap, 5.0, 1.2, 1.0,
                                             sCMangosAHBotRng->Engine());
         for (auto& c : pop) c.skill = c.cap; // force producers to isolate the demand mix
 
@@ -1007,8 +1007,15 @@ void CMangosAHBot::BuildPopulation()
     auto weights = ParseWeights(cfg.craftProfessionWeights);
     auto [alpha, beta] = BetaForState(cfg.craftSkillDist, _caps.state,
                                       cfg.progTbcAtState, cfg.progWotlkAtState);
+    // Fraction of established max crafters (they PRODUCE bags/flasks/gems/gear). Beta
+    // alone never lands on cap, so without this the production layer never runs. An
+    // established server (plenty of maxed crafters) wants a healthy fraction even early.
+    // Craft.LevelingShare (percent leveling) overrides; -1 derives a state-scaled value.
+    double atCapFraction = (cfg.craftLevelingShare >= 0)
+        ? (100.0 - std::min(100, cfg.craftLevelingShare)) / 100.0
+        : std::min(0.85, 0.40 + 0.02 * _caps.state);
     _population = CraftSim::RollPopulation(cfg.craftPopulation, weights, cap, alpha, beta,
-                                           sCMangosAHBotRng->Engine());
+                                           atCapFraction, sCMangosAHBotRng->Engine());
 
     // Profession share of the rolled population (for §4.5 CD daily caps).
     _professionShare.clear();
@@ -1021,10 +1028,9 @@ void CMangosAHBot::BuildPopulation()
 
     uint32_t below = 0;
     for (auto& c : _population) if (c.leveling()) ++below;
-    LOG_INFO("module", "CMangosAHBot[craft]: population rolled — {} crafters (cap={} below-cap={} "
-             "beta={:.1f}/{:.1f} chances g/gr/y/o={}/{}/{}/{}).",
-             _population.size(), cap, below, alpha, beta,
-             _craftChances.grey, _craftChances.green, _craftChances.yellow, _craftChances.orange);
+    LOG_INFO("module", "CMangosAHBot[craft]: population rolled — {} crafters (cap={} leveling={} "
+             "producers={} atCapFrac={:.2f} beta={:.1f}/{:.1f}).",
+             _population.size(), cap, below, _population.size() - below, atCapFraction, alpha, beta);
 }
 
 void CMangosAHBot::UpdatePopulationCaps()
