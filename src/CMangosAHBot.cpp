@@ -30,6 +30,7 @@
 #include "Random.h"
 #include "Log.h"
 #include <algorithm>
+#include <cstdio>
 #include <ctime>
 #include <limits>
 #include <sstream>
@@ -104,6 +105,7 @@ void CMangosAHBot::Initialize()
     {
         BuildVendorSet();
         BuildClassifiedSources();
+        BuildItemExpansion();
         BuildProfessionPool();
         BuildDisenchantPool();
         LoadOverrides();
@@ -117,7 +119,7 @@ void CMangosAHBot::Initialize()
     if (cfg.craftEnable && !_craftBuilt)
     {
         sCMangosAHBotRng->Seed(cfg.craftSeed);
-        _craftGraph.Build(cfg, _vendorItems);
+        _craftGraph.Build(cfg, _vendorItems, _itemExpansion);
         _craftBuilt = true;
         // The legacy Items.Profession source stays active until craft sessions produce
         // listings (C3); only then is it retired (double-listing guard). Note it here.
@@ -126,6 +128,10 @@ void CMangosAHBot::Initialize()
     }
 
     RefreshProgression(true); // sets caps, builds filtered vectors, logs sizes, masks craft graph
+
+    // Roll the crafter population once caps/candidates exist (C3, §4.1).
+    if (_craftBuilt)
+        BuildPopulation();
 
     // Guardrail (plan §6): a critical empty vector means a source contributes nothing.
     bool anyEmpty = _creature[0].empty() || _fishing.empty() || _gameobject.empty() ||
@@ -180,11 +186,85 @@ void CMangosAHBot::CraftStartupDiagnostics()
     // Restore the live mask.
     _craftGraph.RecomputeMask(_caps, cfg.progTbcAtState, cfg.progWotlkAtState, cfg.progSkillCaps);
 
+    // Reagent-era leak scan (sentinel mats from addendum §8 / constraint #6 sentinel list).
+    {
+        static const std::pair<uint32_t, const char*> kSentinels[] = {
+            {21877,"Netherweave Cloth"},{33470,"Frostweave Cloth"},
+            {23424,"Fel Iron Ore"},{36912,"Saronite Ore"}};
+        for (auto& [mat, name] : kSentinels)
+        {
+            auto it = _itemExpansion.find(mat);
+            int matExp = it == _itemExpansion.end() ? -1 : int(it->second);
+            uint32_t consumers = 0, availConsumers = 0;
+            std::string example;
+            for (const CraftRecipe& r : _craftGraph.Recipes())
+                for (auto& [rid, rc] : r.reagents)
+                    if (rid == mat)
+                    {
+                        ++consumers;
+                        if (r.available) { ++availConsumers;
+                            if (example.empty())
+                            { ItemTemplate const* p = sObjectMgr->GetItemTemplate(r.productItem);
+                              example = p ? p->Name1 : std::to_string(r.productItem); } }
+                    }
+            LOG_INFO("module", "CMangosAHBot[craft]: sentinel {} (id {}) itemExpansion={} — {} recipes consume it, "
+                     "{} AVAILABLE at state {} (leak e.g. '{}')", name, mat, matExp, consumers,
+                     availConsumers, int(_caps.state), example);
+        }
+    }
+
+    // Vanilla leveling-glut presence probe: confirm the historically-correct gluts
+    // (smelted bars, cloth bolts, bandages) are in the state-0 available pool.
+    {
+        static const std::pair<uint32_t, const char*> kGlut[] = {
+            {2840,"Copper Bar"},{2841,"Bronze Bar"},{3576,"Tin Bar"},
+            {2996,"Bolt of Linen Cloth"},{2997,"Bolt of Woolen Cloth"},
+            {1251,"Linen Bandage"},{2581,"Heavy Wool Bandage"}};
+        std::string present, absent;
+        for (auto& [item, name] : kGlut)
+        {
+            bool avail = false;
+            if (const std::vector<uint32_t>* prod = _craftGraph.Producers(item))
+                for (uint32_t idx : *prod)
+                    if (_craftGraph.Recipes()[idx].available) { avail = true; break; }
+            (avail ? present : absent) += std::string(name) + "; ";
+        }
+        LOG_INFO("module", "CMangosAHBot[craft]: glut presence @state{} — AVAILABLE: {} | ABSENT: {}",
+                 int(_caps.state), present.empty() ? "(none)" : present, absent.empty() ? "(none)" : absent);
+
+        // Crafted cross-era sentinels (addendum C4 §12): these MUST be absent below
+        // their state — bags/flasks that consume crafted cross-era mats.
+        static const std::pair<uint32_t, const char*> kXera[] = {
+            {21841,"Netherweave Bag (TBC)"},{43575,"Glacial Bag (WotLK)"},
+            {46376,"Flask of the Frost Wyrm (WotLK)"}};
+        std::string leaked;
+        for (auto& [item, name] : kXera)
+        {
+            bool avail = false;
+            if (const std::vector<uint32_t>* prod = _craftGraph.Producers(item))
+                for (uint32_t idx : *prod)
+                    if (_craftGraph.Recipes()[idx].available) { avail = true; break; }
+            if (avail) leaked += std::string(name) + "; ";
+        }
+        LOG_INFO("module", "CMangosAHBot[craft]: crafted cross-era sentinels @state{} — LEAKED: {}",
+                 int(_caps.state), leaked.empty() ? "(none, correct)" : leaked);
+    }
+
     // C2 hand-check: cost the real graph (5 representative chains + cycle stats).
-    std::istringstream ss(CraftCostChains(0));
-    std::string line;
-    while (std::getline(ss, line))
-        LOG_INFO("module", "{}", line);
+    {
+        std::istringstream ss(CraftCostChains(0));
+        std::string line;
+        while (std::getline(ss, line))
+            LOG_INFO("module", "{}", line);
+    }
+
+    // C3 hand-check: a 500-session leveling snapshot (the emergent glut).
+    {
+        std::istringstream ss(CraftSimulateSessions(500));
+        std::string line;
+        while (std::getline(ss, line))
+            LOG_INFO("module", "{}", line);
+    }
 }
 
 // ===========================================================================
@@ -394,6 +474,331 @@ std::string CMangosAHBot::CraftSimulateCost(uint32_t n) const
     return CraftCostChains(n);
 }
 
+// ===========================================================================
+// Craft session layer (crafting addendum §4) — C3 (leveling only)
+// ===========================================================================
+
+namespace
+{
+    std::vector<std::pair<uint32_t, uint32_t>> ParseWeights(const std::string& raw)
+    {
+        std::vector<std::pair<uint32_t, uint32_t>> out;
+        std::istringstream ss(raw);
+        std::string tok;
+        while (std::getline(ss, tok, ','))
+        {
+            auto colon = tok.find(':');
+            if (colon == std::string::npos) continue;
+            try {
+                uint32_t sl = std::stoul(tok.substr(0, colon));
+                uint32_t w  = std::stoul(tok.substr(colon + 1));
+                if (sl && w) out.emplace_back(sl, w);
+            } catch (...) {}
+        }
+        return out;
+    }
+
+    // Default Beta shape per era when Craft.SkillDist has no row for the state:
+    // early = mass spread low (everyone leveling), late = mass near cap.
+    std::pair<double, double> DefaultBeta(uint8_t state, uint32_t tbcAt, uint32_t wotlkAt)
+    {
+        if (state < tbcAt)   return { 2.0, 3.0 }; // mean 0.40 of cap
+        if (state < wotlkAt) return { 3.0, 2.0 }; // mean 0.60
+        return { 5.0, 1.5 };                      // mean 0.77
+    }
+
+    // SkillDist row "state:alpha:beta,..." lookup; falls back to DefaultBeta.
+    std::pair<double, double> BetaForState(const std::string& raw, uint8_t state,
+                                           uint32_t tbcAt, uint32_t wotlkAt)
+    {
+        std::istringstream ss(raw);
+        std::string tok;
+        while (std::getline(ss, tok, ','))
+        {
+            uint32_t s; double a, b;
+            if (std::sscanf(tok.c_str(), "%u:%lf:%lf", &s, &a, &b) == 3 && s == state && a > 0 && b > 0)
+                return { a, b };
+        }
+        return DefaultBeta(state, tbcAt, wotlkAt);
+    }
+}
+
+void CMangosAHBot::BuildCraftCandidates()
+{
+    _craftCandidates.clear();
+    if (!_craftBuilt)
+        return;
+    for (const CraftRecipe& r : _craftGraph.Recipes())
+        if (r.available)
+            _craftCandidates[r.skillLine].push_back(&r);
+}
+
+void CMangosAHBot::BuildPopulation()
+{
+    const auto& cfg = gCMangosAHBotConfig;
+    _craftChances.grey   = sWorld->getIntConfig(CONFIG_SKILL_CHANCE_GREY);
+    _craftChances.green  = sWorld->getIntConfig(CONFIG_SKILL_CHANCE_GREEN);
+    _craftChances.yellow = sWorld->getIntConfig(CONFIG_SKILL_CHANCE_YELLOW);
+    _craftChances.orange = sWorld->getIntConfig(CONFIG_SKILL_CHANCE_ORANGE);
+
+    uint16_t cap = CraftSim::CapForState(_caps.state, cfg.progTbcAtState, cfg.progWotlkAtState);
+    auto weights = ParseWeights(cfg.craftProfessionWeights);
+    auto [alpha, beta] = BetaForState(cfg.craftSkillDist, _caps.state,
+                                      cfg.progTbcAtState, cfg.progWotlkAtState);
+    _population = CraftSim::RollPopulation(cfg.craftPopulation, weights, cap, alpha, beta,
+                                           sCMangosAHBotRng->Engine());
+
+    uint32_t below = 0;
+    for (auto& c : _population) if (c.leveling()) ++below;
+    LOG_INFO("module", "CMangosAHBot[craft]: population rolled — {} crafters (cap={} below-cap={} "
+             "beta={:.1f}/{:.1f} chances g/gr/y/o={}/{}/{}/{}).",
+             _population.size(), cap, below, alpha, beta,
+             _craftChances.grey, _craftChances.green, _craftChances.yellow, _craftChances.orange);
+}
+
+void CMangosAHBot::UpdatePopulationCaps()
+{
+    uint16_t cap = CraftSim::CapForState(_caps.state, gCMangosAHBotConfig.progTbcAtState,
+                                         gCMangosAHBotConfig.progWotlkAtState);
+    for (auto& c : _population)
+        c.cap = cap; // skills persist; crafters resume leveling toward the new cap
+}
+
+void CMangosAHBot::RunLevelingSessions(std::vector<Crafter>& pop, uint32_t n,
+                                       CMangosAHBotCost& cost, std::vector<CraftListing>& out)
+{
+    const auto& cfg = gCMangosAHBotConfig;
+    if (pop.empty())
+        return;
+
+    for (uint32_t s = 0; s < n; ++s)
+    {
+        if (!sCMangosAHBotRng->RollPct(cfg.craftChance))
+            continue;
+        Crafter& cr = pop[sCMangosAHBotRng->Urand(0, uint32_t(pop.size() - 1))];
+        if (!cr.leveling())
+            continue; // at cap => production, disabled in C3
+
+        auto it = _craftCandidates.find(cr.skillLine);
+        if (it == _craftCandidates.end())
+            continue;
+        const CraftRecipe* r = CraftSim::ChooseLevelingRecipe(it->second, cr.skill, cost,
+                                                              _craftChances, sCMangosAHBotRng->Engine());
+        if (!r)
+            continue;
+
+        uint32_t batch = sCMangosAHBotRng->Urand(cfg.craftBatchLevelingMin, cfg.craftBatchLevelingMax);
+        CraftSim::SimulateSkillUps(cr, *r, batch, _craftChances, sCMangosAHBotRng->Engine());
+
+        uint64_t matcost = CraftSim::MatCost(*r, cost);
+        uint32_t margin  = sCMangosAHBotRng->Urand(cfg.craftMarginLevelingMin, cfg.craftMarginLevelingMax);
+        uint64_t unit    = matcost * margin / 100; // leveling dump: below cost by construction
+
+        CraftListing L;
+        L.itemId      = r->productItem;
+        L.count       = batch * r->productCount;
+        L.unitPrice   = unit;
+        L.unitMatCost = matcost;
+        L.skillLine   = r->skillLine;
+        L.category    = static_cast<uint8_t>(r->category);
+        out.push_back(L);
+        // ledger.Credit(reagents) is the buyer's demand ledger — C5.
+    }
+}
+
+void CMangosAHBot::CraftSellPass(Player* bot, uint32_t houseIdx)
+{
+    const auto& cfg = gCMangosAHBotConfig;
+    if (!_craftBuilt || _population.empty())
+        return;
+
+    uint32_t fid = CMAHB_AH_FIDS[houseIdx];
+    AuctionHouseEntry const* ahEntry = sAuctionMgr->GetAuctionHouseEntryFromFactionTemplate(fid);
+    AuctionHouseObject* auctionHouse = sAuctionMgr->GetAuctionsMap(fid);
+    if (!ahEntry || !auctionHouse)
+        return;
+
+    // Cost context (facade): median anchors from live bot listings + intrinsic fallback.
+    std::unordered_map<uint32_t, uint64_t> medians;
+    BuildAnchorMedians(medians);
+    ProjSource src(_costProducers);
+    LiveAnchor anchor(medians, [this](uint32_t id) -> uint64_t {
+        ItemTemplate const* p = sObjectMgr->GetItemTemplate(id);
+        return p ? CalculateBuyoutPrice(p) : 0;
+    }, cfg.craftAnchorClampMin, cfg.craftAnchorClampMax);
+    CMangosAHBotCost cost(src, anchor);
+    cost.NewPass();
+
+    std::vector<CraftListing> listings;
+    uint32_t nSessions = sCMangosAHBotRng->Urand(cfg.craftSessionsMin, cfg.craftSessionsMax);
+    RunLevelingSessions(_population, nSessions, cost, listings);
+    if (listings.empty())
+        return;
+
+    auto trans = CharacterDatabase.BeginTransaction();
+    uint32_t posted = 0;
+    for (const CraftListing& L : listings)
+    {
+        ItemTemplate const* proto = sObjectMgr->GetItemTemplate(L.itemId);
+        if (!proto || !PassesFilters(proto))
+            continue;
+        // Layer 3 net (addendum §4) — craft output must respect the caps too.
+        if ((_caps.itemLevelCap != NOCAP && proto->ItemLevel > _caps.itemLevelCap) ||
+            (_caps.reqLevelCap  != NOCAP && proto->RequiredLevel > _caps.reqLevelCap))
+        {
+            ++_layer3Dropped;
+            continue;
+        }
+        uint64_t unit = ValueWithVariance(L.unitPrice);
+        if (unit == 0)
+            continue;
+
+        uint32_t maxStack = std::max(1u, static_cast<uint32_t>(proto->GetMaxStackSize()));
+        uint32_t remaining = L.count;
+        while (remaining > 0)
+        {
+            uint32_t stack = std::min(remaining, maxStack);
+            remaining -= stack;
+            uint64_t buyout64 = unit * stack;
+            uint32_t buyout = buyout64 > NOCAP ? NOCAP : static_cast<uint32_t>(buyout64);
+            if (buyout == 0)
+                continue;
+            uint32_t startbid = static_cast<uint32_t>(static_cast<uint64_t>(buyout) *
+                sCMangosAHBotRng->Urand(cfg.bidMin, std::max(cfg.bidMin, cfg.bidMax)) / 100);
+
+            Item* item = Item::CreateItem(L.itemId, 1, bot);
+            if (!item)
+                continue;
+            item->AddToUpdateQueueOf(bot);
+            if (uint32_t rp = Item::GenerateItemRandomPropertyId(L.itemId))
+                item->SetItemRandomProperties(rp);
+            item->SetCount(stack);
+
+            uint32_t durationSecs = sCMangosAHBotRng->Urand(std::max(1u, cfg.timeMin),
+                std::max(std::max(1u, cfg.timeMin), cfg.timeMax)) * 3600u;
+            uint32_t deposit = sAuctionMgr->GetAuctionDeposit(ahEntry, durationSecs, item, stack);
+
+            AuctionEntry* ae      = new AuctionEntry();
+            ae->Id                = sObjectMgr->GenerateAuctionID();
+            ae->houseId           = AuctionHouseId(CMAHB_AH_IDS[houseIdx]);
+            ae->item_guid         = item->GetGUID();
+            ae->item_template     = item->GetEntry();
+            ae->itemCount         = item->GetCount();
+            ae->owner             = bot->GetGUID();
+            ae->startbid          = startbid;
+            ae->buyout            = buyout;
+            ae->bid               = 0;
+            ae->deposit           = deposit;
+            ae->expire_time       = time(nullptr) + static_cast<time_t>(durationSecs);
+            ae->auctionHouseEntry = ahEntry;
+
+            item->SaveToDB(trans);
+            item->RemoveFromUpdateQueueOf(bot);
+            sAuctionMgr->AddAItem(item);
+            auctionHouse->AddAuction(ae);
+            ae->SaveToDB(trans);
+            ++posted;
+        }
+    }
+    if (posted > 0)
+        CharacterDatabase.CommitTransaction(trans);
+
+    LOG_DEBUG("module", "CMangosAHBot[craft]: sell house={} craftPosted={} layer3Dropped={}",
+              CMAHB_AH_IDS[houseIdx], posted, _layer3Dropped);
+}
+
+std::string CMangosAHBot::CraftSimulateSessions(uint32_t n) const
+{
+    const auto& cfg = gCMangosAHBotConfig;
+    if (!cfg.craftEnable || !_craftBuilt)
+        return "Craft layer disabled (Craft.Enable=0).";
+    if (n == 0) n = 200;
+
+    std::unordered_map<uint32_t, uint64_t> medians;
+    BuildAnchorMedians(medians);
+    ProjSource src(_costProducers);
+    LiveAnchor anchor(medians, [this](uint32_t id) -> uint64_t {
+        ItemTemplate const* p = sObjectMgr->GetItemTemplate(id);
+        return p ? CalculateBuyoutPrice(p) : 0;
+    }, cfg.craftAnchorClampMin, cfg.craftAnchorClampMax);
+    CMangosAHBotCost cost(src, anchor);
+    cost.NewPass();
+
+    // Simulate on a COPY so the snapshot is non-destructive (real leveling advances
+    // the live population in CraftSellPass).
+    std::vector<Crafter> pop = _population;
+    std::vector<CraftListing> listings;
+    const_cast<CMangosAHBot*>(this)->RunLevelingSessions(pop, n, cost, listings);
+
+    // Aggregate by item.
+    struct Agg { uint64_t count=0; uint64_t price=0; uint64_t matcost=0; uint8_t cat=CAT_MISC; };
+    std::unordered_map<uint32_t, Agg> byItem;
+    uint64_t belowCost = 0, layer3Would = 0;
+    for (const CraftListing& L : listings)
+    {
+        auto& a = byItem[L.itemId];
+        a.count += L.count; a.price = L.unitPrice; a.matcost = L.unitMatCost; a.cat = L.category;
+        if (L.unitPrice < L.unitMatCost) ++belowCost;
+        ItemTemplate const* proto = sObjectMgr->GetItemTemplate(L.itemId);
+        if (proto && ((_caps.itemLevelCap != NOCAP && proto->ItemLevel > _caps.itemLevelCap) ||
+                      (_caps.reqLevelCap  != NOCAP && proto->RequiredLevel > _caps.reqLevelCap)))
+            ++layer3Would;
+    }
+
+    std::vector<std::pair<uint32_t, Agg>> sorted(byItem.begin(), byItem.end());
+    std::sort(sorted.begin(), sorted.end(),
+              [](const auto& a, const auto& b) { return a.second.count > b.second.count; });
+
+    // Per-category volume (so bars/bolts/bandages show even when ammo tops the list).
+    uint64_t catVol[CAT_COUNT] = {0};
+    uint64_t pricedBelow = 0, priced = 0;
+    for (auto& [item, a] : byItem)
+    {
+        catVol[a.cat] += a.count;
+        if (a.matcost > 0) { ++priced; if (a.price < a.matcost) ++pricedBelow; }
+    }
+
+    std::ostringstream ss;
+    ss << "Craft leveling sim: " << n << " sessions, seed=" << sCMangosAHBotRng->Seeded()
+       << " state=" << int(_caps.state) << " pop=" << _population.size()
+       << " -> " << listings.size() << " listing-lines / " << byItem.size() << " items"
+       << " | belowCostShare(priced)=" << (priced ? pricedBelow * 100 / priced : 0) << "%"
+       << " layer3Would=" << layer3Would;
+    ss << "\n by category (units):";
+    for (uint8_t c = 0; c < CAT_COUNT; ++c)
+        ss << " " << CategoryName(ItemCategory(c)) << "=" << catVol[c];
+    // Per-profession top product (proves the named gluts: bars/bolts/bandages/greens).
+    std::unordered_map<uint32_t, std::unordered_map<uint32_t, uint64_t>> perProf; // skillLine -> item -> count
+    for (const CraftListing& L : listings)
+        perProf[L.skillLine][L.itemId] += L.count;
+    static const std::pair<uint32_t, const char*> kProf[] = {
+        {171,"Alch"},{164,"BS"},{165,"LW"},{197,"Tailor"},{202,"Eng"},{333,"Ench"},
+        {755,"JC"},{773,"Insc"},{185,"Cook"},{129,"FirstAid"},{186,"Mining"}};
+    ss << "\n by profession top product:";
+    for (auto& [sl, name] : kProf)
+    {
+        auto it = perProf.find(sl);
+        if (it == perProf.end()) continue;
+        uint32_t top = 0; uint64_t topN = 0;
+        for (auto& [item, cnt] : it->second) if (cnt > topN) { topN = cnt; top = item; }
+        ItemTemplate const* p = sObjectMgr->GetItemTemplate(top);
+        ss << "\n  " << name << ": " << (p ? p->Name1 : "?") << " x" << topN;
+    }
+
+    ss << "\n top items by volume (count | unit | matcost | ratio% | cat):";
+    uint32_t shown = 0;
+    for (auto& [item, a] : sorted)
+    {
+        if (shown++ >= 20) break;
+        ItemTemplate const* p = sObjectMgr->GetItemTemplate(item);
+        std::string name = p ? p->Name1 : ("item#" + std::to_string(item));
+        uint64_t ratio = a.matcost ? a.price * 100 / a.matcost : 0;
+        ss << "\n  " << name << " x" << a.count << " | " << a.price << " | " << a.matcost
+           << " | " << ratio << "% | " << CategoryName(ItemCategory(a.cat));
+    }
+    return ss.str();
+}
+
 void CMangosAHBot::ReloadData()
 {
     LoadOverrides();
@@ -434,6 +839,9 @@ void CMangosAHBot::BuildClassifiedSources()
     _skinningClassified.clear();
     _excludedUnspawnedCreature = 0;
     _excludedUnspawnedGO = 0;
+    _creatureLootVotes.clear();
+    _goLootVotes.clear();
+    _skinLootVotes.clear();
 
     // ---- creatures + skinning: entry -> (lootid, skinloot, rank) ----
     struct CT { uint32_t lootid = 0; uint32_t skinloot = 0; uint8_t rank = 0; };
@@ -471,9 +879,13 @@ void CMangosAHBot::BuildClassifiedSources()
                 {
                     MinMerge(lootExp, it->second.lootid, exp);
                     lootRank[it->second.lootid] = it->second.rank;
+                    if (exp < 3) ++_creatureLootVotes[it->second.lootid][exp]; // plurality votes
                 }
                 if (it->second.skinloot)
+                {
                     MinMerge(skinExp, it->second.skinloot, exp);
+                    if (exp < 3) ++_skinLootVotes[it->second.skinloot][exp];
+                }
             }
         } while (r->NextRow());
     }
@@ -513,7 +925,10 @@ void CMangosAHBot::BuildClassifiedSources()
             if (exp == CMAHB_EXP_UNKNOWN) continue;
             auto it = goLoot.find(id);
             if (it != goLoot.end())
+            {
                 MinMerge(goExp, it->second, exp);
+                if (exp < 3) ++_goLootVotes[it->second][exp];
+            }
         } while (r->NextRow());
     }
     for (auto& [lootId, exp] : goExp)
@@ -538,6 +953,67 @@ void CMangosAHBot::BuildClassifiedSources()
         _creatureClassified[3].size(), _creatureClassified[4].size(),
         _gameobjectClassified.size(), _fishingClassified.size(), _skinningClassified.size(),
         _excludedUnspawnedCreature, _excludedUnspawnedGO);
+}
+
+void CMangosAHBot::BuildItemExpansion()
+{
+    // Expansion each item most typically comes from, for reagent-era gating of the
+    // craft graph (a recipe can't be earlier than its rarest mat) — closes the
+    // ilvl/skill-exempt leak (Netherweave net/bag at Vanilla).
+    //
+    // PLURALITY by spawn count, NOT min: TBC/WotLK instance maps carry unreliable
+    // MapEntry::expansionID (often 0), so a MIN over sources drags cloth (which also
+    // drops in mis-flagged instances) to Vanilla. Netherweave's 6000+ open-world
+    // Outland spawns outvote the handful in instances. Ore is unaffected (open-world
+    // only) which is why it already classified right. This is deliberately separate
+    // from the base source-vector MinMerge, so world-drop gating is unchanged (#1).
+    _itemExpansion.clear();
+
+    std::unordered_map<uint32_t, std::array<uint32_t, 3>> itemVotes;
+    auto addVotes = [&](const char* tbl,
+                        const std::unordered_map<uint32_t, std::array<uint32_t, 3>>& lootVotes)
+    {
+        if (QueryResult r = WorldDatabase.Query("SELECT item, entry FROM {} WHERE item > 0", tbl))
+        {
+            do
+            {
+                Field* f = r->Fetch();
+                uint32_t item = f[0].Get<uint32_t>();
+                auto it = lootVotes.find(f[1].Get<uint32_t>());
+                if (it != lootVotes.end())
+                    for (int e = 0; e < 3; ++e) itemVotes[item][e] += it->second[e];
+            } while (r->NextRow());
+        }
+    };
+    addVotes("creature_loot_template",   _creatureLootVotes);
+    addVotes("gameobject_loot_template", _goLootVotes);
+    addVotes("skinning_loot_template",   _skinLootVotes);
+
+    // Fishing: one vote per area at its (open-world) expansion — no spawn weight.
+    for (auto& c : _fishingClassified)
+    {
+        if (c.expansion < 3)
+        {
+            if (QueryResult r = WorldDatabase.Query(
+                    "SELECT item FROM fishing_loot_template WHERE entry = {} AND item > 0", c.lootId))
+                do { ++itemVotes[r->Fetch()[0].Get<uint32_t>()][c.expansion]; } while (r->NextRow());
+        }
+    }
+
+    // Plurality: pick the expansion with the most spawn-weight; tie-break to the
+    // higher era (safer to over-gate a genuinely cross-era mat than to leak it).
+    uint32_t tbc = 0, wotlk = 0;
+    for (auto& [item, v] : itemVotes)
+    {
+        uint8_t best = 0; uint32_t bestN = v[0];
+        for (uint8_t e = 1; e < 3; ++e)
+            if (v[e] >= bestN) { bestN = v[e]; best = e; } // >= => tie to higher era
+        if (bestN == 0) continue;
+        _itemExpansion[item] = best;
+        if (best == CMAHB_EXP_TBC) ++tbc; else if (best == CMAHB_EXP_WOTLK) ++wotlk;
+    }
+    LOG_INFO("module", "CMangosAHBot: item->expansion map = {} items ({} TBC, {} WotLK), plurality-classified "
+             "for reagent-era gating", _itemExpansion.size(), tbc, wotlk);
 }
 
 void CMangosAHBot::BuildProfessionPool()
@@ -691,6 +1167,8 @@ void CMangosAHBot::RefreshProgression(bool force)
         {
             _craftGraph.RecomputeMask(_caps, cfg.progTbcAtState, cfg.progWotlkAtState, cfg.progSkillCaps);
             BuildCostProjection();
+            BuildCraftCandidates();
+            UpdatePopulationCaps(); // no-op until the population exists (built in Initialize)
             LOG_INFO("module", "CMangosAHBot[craft]: mask recomputed for state {} — available {}/{} recipes "
                      "(JC={} Inscription={}).", _caps.state, _craftGraph.AvailableCount(), _craftGraph.Size(),
                      _craftGraph.SkillLineAvailableCount(SKILL_JEWELCRAFTING),
@@ -791,7 +1269,11 @@ void CMangosAHBot::AddLootToItemMap(Player* bot, CmAHBItemMap& out)
     SimSource(_gameobject, LootTemplates_Gameobject, cfg.gameobject, bot, out);
     SimSource(_skinning,   LootTemplates_Skinning,   cfg.skinning,   bot, out);
     SimSource(_disenchant, LootTemplates_Disenchant, cfg.disenchant, bot, out);
-    SimProfession(out);
+    // Retire the flat Items.Profession source when the craft layer is producing
+    // (double-listing guard, addendum risk table). Craft listings come from
+    // CraftSellPass instead.
+    if (!cfg.craftEnable)
+        SimProfession(out);
     ApplyOverridesToMap(out);
 }
 
@@ -1090,7 +1572,10 @@ void CMangosAHBot::Update()
         _houseAction = (_houseAction + 1) % 6;
         uint32_t house = _houseAction % CMAHB_HOUSE_COUNT;
         if (_houseAction < CMAHB_HOUSE_COUNT)
-            WithTransientBot([&](Player* b) { SellPass(b, house, false); });
+            WithTransientBot([&](Player* b) {
+                SellPass(b, house, false);
+                if (cfg.craftEnable) CraftSellPass(b, house);
+            });
         else
             WithTransientBot([&](Player* b) { BuyPass(b, house); });
     }
@@ -1154,7 +1639,10 @@ void CMangosAHBot::Rebuild(bool /*all*/, uint32_t forHouse)
     for (uint32_t p = 0; p < passes; ++p)
         for (uint32_t h = 0; h < CMAHB_HOUSE_COUNT; ++h)
             if (forHouse == CMAHB_HOUSE_COUNT || forHouse == h)
-                WithTransientBot([&](Player* b) { SellPass(b, h, true); }); // prefill
+                WithTransientBot([&](Player* b) {
+                    SellPass(b, h, true); // prefill world drops
+                    if (gCMangosAHBotConfig.craftEnable) CraftSellPass(b, h); // prefill craft
+                });
 
     LOG_INFO("module", "CMangosAHBot: rebuild complete ({} passes/house).", passes);
 }

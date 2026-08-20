@@ -11,7 +11,7 @@ against a hand-built ~30-recipe fixture that includes a **transmute cycle**, a
 Directly with a compiler (fastest):
 
 ```sh
-g++ -std=c++17 -I../../src test_craft.cpp ../../src/CMangosAHBotCost.cpp -o craft-tests
+g++ -std=c++17 -I../../src test_craft.cpp ../../src/CMangosAHBotCost.cpp ../../src/CMangosAHBotCraft.cpp -o craft-tests
 ./craft-tests            # exit 0 = all pass; prints "CRAFT-TESTS: PASS (N passed, 0 failed)"
 ```
 

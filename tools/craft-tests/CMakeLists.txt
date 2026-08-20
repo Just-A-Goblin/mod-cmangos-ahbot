@@ -16,7 +16,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 add_executable(craft-tests
     test_craft.cpp
-    ../../src/CMangosAHBotCost.cpp)
+    ../../src/CMangosAHBotCost.cpp
+    ../../src/CMangosAHBotCraft.cpp)
 target_include_directories(craft-tests PRIVATE ../../src)
 
 enable_testing()

@@ -41,7 +41,7 @@ public:
         if (!sub)
         {
             handler->SendSysMessage("cmahbot: status | reload | rebuild [ally|horde|neutral] | "
-                                    "progression [refresh] | craft <status|selftest|simulate [n]> | "
+                                    "progression [refresh] | craft <status|selftest|simulate [n]|cost [n]> | "
                                     "item <id> <value> <chance> <min> <max> | item reset <id>");
             return true;
         }
@@ -83,6 +83,13 @@ public:
                 return true;
             }
             if (p2 && strncmp(p2, "simulate", strlen(p2)) == 0)
+            {
+                char* nArg = strtok(nullptr, " ");
+                uint32_t n = nArg ? static_cast<uint32_t>(strtoul(nArg, nullptr, 0)) : 0;
+                SendMultiline(handler, sCMangosAHBot->CraftSimulateSessions(n));
+                return true;
+            }
+            if (p2 && strncmp(p2, "cost", strlen(p2)) == 0)
             {
                 char* nArg = strtok(nullptr, " ");
                 uint32_t n = nArg ? static_cast<uint32_t>(strtoul(nArg, nullptr, 0)) : 0;

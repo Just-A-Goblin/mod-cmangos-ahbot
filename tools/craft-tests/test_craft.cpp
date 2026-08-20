@@ -10,8 +10,10 @@
  * Run:    ./craft-tests   (exit 0 = all pass)
  */
 #include "CMangosAHBotCost.h"
+#include "CMangosAHBotCraft.h"
 #include <cstdio>
 #include <cstdint>
+#include <random>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -215,6 +217,68 @@ int main()
 
     // 13. Fixture size sanity (~30 recipes incl. cycle, multi-output, CD).
     check(src.recipes.size() >= 15, "fixture has enough recipes");
+
+    // -----------------------------------------------------------------------
+    // Craft-sim layer (§4): skill-up chance, glut chooser, skill-ups, population
+    // -----------------------------------------------------------------------
+    std::printf("== craft-sim tests ==\n");
+    CraftSkillChances chances; // AC defaults 0/25/75/100
+
+    // 14. Skill-up chance bands (C-A2). grey=100, yellow=25 -> green=62.
+    checkEq(CraftSim::SkillGainChancePerMille(10, 100, 25, chances), 1000, "S<yellow -> orange 100%");
+    checkEq(CraftSim::SkillGainChancePerMille(30, 100, 25, chances), 750,  "yellow<=S<green -> 75%");
+    checkEq(CraftSim::SkillGainChancePerMille(70, 100, 25, chances), 250,  "green<=S<grey -> 25%");
+    checkEq(CraftSim::SkillGainChancePerMille(100,100, 25, chances), 0,    "S>=grey -> 0%");
+
+    // 15. Glut chooser: at S=50 the cheapest trainable recipe wins the most weight,
+    //     and grey/too-high recipes are never chosen. Values come out of the fixture
+    //     anchors (COPPER_ORE=50, SILVER_ORE=120) via the cost engine.
+    auto mkRecipe = [](uint32_t product, std::vector<std::pair<uint32_t,uint32_t>> reag,
+                       uint16_t minS, uint16_t yellow, uint16_t grey) {
+        CraftRecipe r; r.productItem=product; r.productCount=1; r.reagents=std::move(reag);
+        r.minSkill=minS; r.yellowSkill=yellow; r.greySkill=grey; r.available=true; return r;
+    };
+    CraftRecipe cheapBar   = mkRecipe(5001, {{COPPER_ORE,1}}, 1, 25, 100);   // matcost 50
+    CraftRecipe dearTrinket= mkRecipe(5002, {{SILVER_ORE,2}}, 1, 25, 100);   // matcost 240
+    CraftRecipe alreadyGrey= mkRecipe(5003, {{COPPER_ORE,1}}, 1, 10, 40);    // grey at S=50
+    CraftRecipe tooHigh    = mkRecipe(5004, {{COPPER_ORE,1}}, 80, 100, 200); // minSkill 80
+    std::vector<const CraftRecipe*> cands = {&cheapBar,&dearTrinket,&alreadyGrey,&tooHigh};
+
+    cost.NewPass();
+    check(CraftSim::LevelingScore(cheapBar, 50, cost, chances) >
+          CraftSim::LevelingScore(dearTrinket, 50, cost, chances),
+          "cheaper recipe scores higher (skill-up per gold)");
+    checkEq((uint64_t)(CraftSim::LevelingScore(alreadyGrey,50,cost,chances)*1000), 0, "grey recipe scores 0");
+    checkEq((uint64_t)(CraftSim::LevelingScore(tooHigh,50,cost,chances)*1000), 0, "too-high recipe scores 0");
+
+    std::mt19937 rng(999);
+    int cntCheap=0, cntDear=0, cntOther=0;
+    for (int i=0;i<2000;++i) {
+        const CraftRecipe* pick = CraftSim::ChooseLevelingRecipe(cands, 50, cost, chances, rng);
+        if (pick==&cheapBar) ++cntCheap; else if (pick==&dearTrinket) ++cntDear; else ++cntOther;
+    }
+    check(cntCheap > cntDear, "cheapest recipe chosen most often (emergent glut)");
+    checkEq((uint64_t)cntOther, 0, "grey/too-high recipes never chosen");
+
+    // 16. Skill-ups advance skill, bounded by cap; none once grey.
+    Crafter cr{171, 10, 300};
+    uint32_t ups = CraftSim::SimulateSkillUps(cr, cheapBar, 200, chances, rng);
+    check(ups > 0 && cr.skill == 10 + ups, "skill-ups advance skill by the count returned");
+    Crafter atGrey{171, 150, 300};
+    checkEq(CraftSim::SimulateSkillUps(atGrey, cheapBar, 100, chances, rng), 0, "no skill-ups past grey");
+
+    // 17. Population roll: right size, skills in [1,cap], professions from weights.
+    auto pop = CraftSim::RollPopulation(500, {{171,3},{164,1}}, 300, 2.0, 3.0, rng);
+    checkEq((uint64_t)pop.size(), 500, "population size honored");
+    bool skillsOk=true, profOk=true; uint32_t below=0;
+    for (auto& c : pop) {
+        if (c.skill < 1 || c.skill > 300) skillsOk=false;
+        if (c.skillLine!=171 && c.skillLine!=164) profOk=false;
+        if (c.leveling()) ++below;
+    }
+    check(skillsOk, "all skills within [1,cap]");
+    check(profOk, "all professions from the weight table");
+    check(below > 0, "a fresh (state-0) population has below-cap levelers");
 
     std::printf("CRAFT-TESTS: %s  (%d passed, %d failed)\n",
                 g_fail==0 ? "PASS" : "FAIL", g_pass, g_fail);

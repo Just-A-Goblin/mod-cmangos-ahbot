@@ -4,6 +4,8 @@
 #include "CMangosAHBotProgression.h"
 #include "CMangosAHBotRecipes.h"
 #include "CMangosAHBotCost.h"
+#include "CMangosAHBotCraft.h"
+#include <array>
 #include <functional>
 #include <string>
 #include <unordered_map>
@@ -51,13 +53,15 @@ public:
     // with it off the module is behaviorally identical to the base seller/buyer.
     std::string CraftStatusReport() const;
     std::string CraftSelfTest() const;   // single "CRAFT SELFTEST: PASS|FAIL ..." line
-    std::string CraftSimulateCost(uint32_t n) const; // C2: cost queries only, no listing
+    std::string CraftSimulateCost(uint32_t n) const;     // C2: cost queries only, no listing
+    std::string CraftSimulateSessions(uint32_t n) const; // C3: run sessions, listing suppressed
 
 private:
     CMangosAHBot() = default;
 
     // Enumeration + classification (Phase 3 / addendum Phase 3.5)
     void BuildClassifiedSources();
+    void BuildItemExpansion(); // itemId -> earliest expansion (from loot sources), for reagent-era gating
     void BuildProfessionPool();
     void BuildDisenchantPool();
     void BuildVendorSet();
@@ -80,6 +84,17 @@ private:
     void BuildAnchorMedians(std::unordered_map<uint32_t, uint64_t>& out) const;
     // C2 cost hand-check over the real graph (logged at startup + `craft simulate`).
     std::string CraftCostChains(uint32_t sampleN) const;
+
+    // Craft session layer (C3, §4). Population is rolled at init and its caps track
+    // progression; candidates are the available recipes per skill line.
+    void BuildPopulation();
+    void UpdatePopulationCaps();     // on progression change: raise caps, keep skills
+    void BuildCraftCandidates();     // skillLine -> available recipes (rebuilt with the mask)
+    // Run n leveling sessions over `pop`, appending would-be listings to `out`.
+    // Mutates `pop` (skill-ups). Production sessions are disabled in C3.
+    void RunLevelingSessions(std::vector<Crafter>& pop, uint32_t n, CMangosAHBotCost& cost,
+                             std::vector<CraftListing>& out);
+    void CraftSellPass(Player* bot, uint32_t houseIdx); // real sessions -> posted listings
 
     // Simulation (Phase 4)
     void AddLootToItemMap(Player* bot, CmAHBItemMap& out);
@@ -125,6 +140,14 @@ private:
 
     std::unordered_set<uint32_t> _vendorItems;
     std::unordered_map<uint32_t, CmAHBOverride> _overrides;
+    std::unordered_map<uint32_t, uint8_t> _itemExpansion; // mat/item -> plurality expansion
+
+    // Spawn-count votes per loot id per expansion [vanilla,tbc,wotlk], accumulated in
+    // BuildClassifiedSources and consumed by BuildItemExpansion (plurality classify).
+    // Separate from the MinMerge'd source vectors so base gating is unchanged (#1).
+    std::unordered_map<uint32_t, std::array<uint32_t, 3>> _creatureLootVotes;
+    std::unordered_map<uint32_t, std::array<uint32_t, 3>> _goLootVotes;
+    std::unordered_map<uint32_t, std::array<uint32_t, 3>> _skinLootVotes;
 
     // diagnostics
     uint32_t _excludedUnspawnedCreature = 0;
@@ -146,6 +169,12 @@ private:
     // never reallocated while indexed.
     std::vector<CostRecipe> _costRecipes;
     std::unordered_map<uint32_t, std::vector<const CostRecipe*>> _costProducers;
+
+    // Craft session state (C3). Candidate pointers reference _craftGraph.Recipes(),
+    // which is stable after Build(); the mask flips availability in place.
+    std::vector<Crafter> _population;
+    std::unordered_map<uint32_t, std::vector<const CraftRecipe*>> _craftCandidates;
+    CraftSkillChances _craftChances;
 };
 
 #define sCMangosAHBot CMangosAHBot::instance()

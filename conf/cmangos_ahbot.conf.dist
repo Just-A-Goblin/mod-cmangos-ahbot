@@ -143,7 +143,9 @@ CMangosAHBot.Craft.Seed              = 0
 # (skillLineId:weight). The distribution, not the individuals, is the model —
 # the population is re-rolled from Craft.SkillDist on every restart.
 CMangosAHBot.Craft.Population        = 120
-CMangosAHBot.Craft.ProfessionWeights = "171:20,164:12,165:12,197:15,202:10,333:10,755:10,773:6,185:3,129:2"
+# skillLineId:weight. 186 = Mining (smelters -> bars). Ids: 171 Alch, 164 BS,
+# 165 LW, 197 Tailor, 202 Eng, 333 Ench, 755 JC, 773 Insc, 185 Cook, 129 First Aid.
+CMangosAHBot.Craft.ProfessionWeights = "171:20,164:12,165:12,197:15,202:10,333:10,755:10,773:6,185:3,129:2,186:8"
 
 # Beta shape params per progression state: "state:alpha:beta,...". Early states
 # spread skill across 1..cap (fresh-server intermediate glut); late states mass

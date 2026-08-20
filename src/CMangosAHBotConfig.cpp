@@ -155,8 +155,10 @@ void CMangosAHBotConfig::Load()
     ParseUIntPair("CMangosAHBot.Craft.Sessions", "4,8", craftSessionsMin, craftSessionsMax);
     craftChance     = sConfigMgr->GetOption<uint32_t>("CMangosAHBot.Craft.Chance", 100);
     craftLevelingShare = sConfigMgr->GetOption<int32_t>("CMangosAHBot.Craft.LevelingShare", -1);
+    // Default adds Mining(186) to the addendum §8.1 list so smelters exist and bars
+    // are a glut (the C3 acceptance names "smelted bars"; the spec's list omitted it).
     craftProfessionWeights = sConfigMgr->GetOption<std::string>("CMangosAHBot.Craft.ProfessionWeights",
-        "171:20,164:12,165:12,197:15,202:10,333:10,755:10,773:6,185:3,129:2");
+        "171:20,164:12,165:12,197:15,202:10,333:10,755:10,773:6,185:3,129:2,186:8");
     craftSkillDist  = sConfigMgr->GetOption<std::string>("CMangosAHBot.Craft.SkillDist", "");
     ParseUIntPair("CMangosAHBot.Craft.Batch.Leveling", "5,15", craftBatchLevelingMin, craftBatchLevelingMax);
     craftGearWindow = sConfigMgr->GetOption<uint32_t>("CMangosAHBot.Craft.GearWindow", 26);

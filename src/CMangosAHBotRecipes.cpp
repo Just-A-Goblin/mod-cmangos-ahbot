@@ -119,7 +119,8 @@ RecipeRarity CMangosAHBotRecipeGraph::ClassifyRarity(
 }
 
 void CMangosAHBotRecipeGraph::Build(const CMangosAHBotConfig& cfg,
-                                    const std::unordered_set<uint32_t>& vendorItems)
+                                    const std::unordered_set<uint32_t>& vendorItems,
+                                    const std::unordered_map<uint32_t, uint8_t>& itemExpansion)
 {
     auto t0 = std::chrono::steady_clock::now();
 
@@ -279,18 +280,54 @@ void CMangosAHBotRecipeGraph::Build(const CMangosAHBotConfig& cfg,
         }
         rec.category = cat;
 
-        // Bake expansion: max(skill-line era, skill-rank era, scroll=WotLK).
+        // Bake expansion: max(skill-line era, skill-rank era, scroll=WotLK, reagent era).
         uint8_t exp = CMAHB_EXP_VANILLA;
         if (rec.skillLine == SKILL_JEWELCRAFTING) exp = std::max(exp, CMAHB_EXP_TBC);
         if (rec.skillLine == SKILL_INSCRIPTION)   exp = std::max(exp, CMAHB_EXP_WOTLK);
         if (rec.minSkill > skillCaps[1])          exp = std::max(exp, CMAHB_EXP_WOTLK);
         else if (rec.minSkill > skillCaps[0])     exp = std::max(exp, CMAHB_EXP_TBC);
         if (cat == CAT_SCROLL)                    exp = std::max(exp, CMAHB_EXP_WOTLK);
-        rec.expansion = exp;
+        rec.expansion = exp; // reagent-era folded in by the fixpoint below
 
         _categoryCounts[cat]++;
         if (rec.dailyCooldown) ++_cooldownCount;
         _profRarity[rec.skillLine][rec.rarity]++;
+    }
+
+    // Reagent-era gate (§2.3 rule 3), to a fixpoint so it propagates through CRAFTED
+    // reagents too: a recipe is no earlier than the era you can obtain its rarest mat,
+    // where a mat's obtain-era = min(looted era, cheapest era it can be crafted). This
+    // catches ilvl/skill-exempt items using cross-era mats whether raw (Netherweave
+    // Net <- Netherweave Cloth) or crafted (Glacial Bag <- Moonshroud <- Frostweave).
+    auto obtainEra = [&](uint32_t item, const std::unordered_map<uint32_t, uint8_t>& prodExp) -> int
+    {
+        int e = -1;
+        if (auto it = itemExpansion.find(item); it != itemExpansion.end() && it->second != CMAHB_EXP_UNKNOWN)
+            e = it->second;
+        if (auto it = prodExp.find(item); it != prodExp.end())
+            e = (e < 0) ? it->second : std::min(e, int(it->second));
+        return e; // -1 = era unknown (leaf with no loot/craft classification)
+    };
+    for (int pass = 0; pass < 8; ++pass)
+    {
+        std::unordered_map<uint32_t, uint8_t> prodExp; // item -> earliest craftable era
+        for (const CraftRecipe& r : _recipes)
+        {
+            auto it = prodExp.find(r.productItem);
+            if (it == prodExp.end() || r.expansion < it->second) prodExp[r.productItem] = r.expansion;
+        }
+        bool changed = false;
+        for (CraftRecipe& r : _recipes)
+        {
+            uint8_t need = r.expansion;
+            for (auto& [rid, rc] : r.reagents)
+            {
+                int re = obtainEra(rid, prodExp);
+                if (re > int(need)) need = uint8_t(re);
+            }
+            if (need > r.expansion) { r.expansion = need; changed = true; }
+        }
+        if (!changed) break;
     }
 
     _buildSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();

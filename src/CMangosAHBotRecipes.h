@@ -81,8 +81,12 @@ class CMangosAHBotRecipeGraph
 public:
     // Build the full graph. Uses sSpellMgr + world DB directly (this IS the
     // concrete recipe source; the facade wraps it in C2). vendorItems is the
-    // module's existing npc_vendor set, reused for VENDOR rarity.
-    void Build(const CMangosAHBotConfig& cfg, const std::unordered_set<uint32_t>& vendorItems);
+    // module's existing npc_vendor set, reused for VENDOR rarity. itemExpansion maps
+    // a mat/item to the earliest expansion it is obtainable in (from loot sources) —
+    // used to bake reagent-era gating (§2.3 rule 3 proxy: a recipe can't be earlier
+    // than its rarest reagent, so a bag using Netherweave is TBC even at ilvl 1).
+    void Build(const CMangosAHBotConfig& cfg, const std::unordered_set<uint32_t>& vendorItems,
+               const std::unordered_map<uint32_t, uint8_t>& itemExpansion);
 
     // Recompute per-recipe availability for the given caps (§2.3). Cheap: only the
     // mask changes on progression transition, not the graph.
