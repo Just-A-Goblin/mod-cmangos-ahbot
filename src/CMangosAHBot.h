@@ -3,6 +3,7 @@
 #include "CMangosAHBotCommon.h"
 #include "CMangosAHBotProgression.h"
 #include "CMangosAHBotRecipes.h"
+#include "CMangosAHBotCost.h"
 #include <functional>
 #include <string>
 #include <unordered_map>
@@ -50,6 +51,7 @@ public:
     // with it off the module is behaviorally identical to the base seller/buyer.
     std::string CraftStatusReport() const;
     std::string CraftSelfTest() const;   // single "CRAFT SELFTEST: PASS|FAIL ..." line
+    std::string CraftSimulateCost(uint32_t n) const; // C2: cost queries only, no listing
 
 private:
     CMangosAHBot() = default;
@@ -69,6 +71,15 @@ private:
     // sweep). Cheap; only runs when the craft graph is built. Leaves the live mask
     // as it found it.
     void CraftStartupDiagnostics();
+
+    // Project the available graph recipes into the cost-engine facade view (§10.2)
+    // and index producers. Rebuilt when the availability mask changes.
+    void BuildCostProjection();
+    // Build the per-pass market-anchor median map from live bot listings (neutral
+    // house, C-A7): itemId -> median buyout-per-unit.
+    void BuildAnchorMedians(std::unordered_map<uint32_t, uint64_t>& out) const;
+    // C2 cost hand-check over the real graph (logged at startup + `craft simulate`).
+    std::string CraftCostChains(uint32_t sampleN) const;
 
     // Simulation (Phase 4)
     void AddLootToItemMap(Player* bot, CmAHBItemMap& out);
@@ -129,6 +140,12 @@ private:
     // Craft layer state (built lazily when Craft.Enable=1).
     CMangosAHBotRecipeGraph _craftGraph;
     bool _craftBuilt = false;
+
+    // Cost-engine facade projection of the available graph (§10.2). Pointers in
+    // _costProducers reference _costRecipes, so it is filled fully then indexed and
+    // never reallocated while indexed.
+    std::vector<CostRecipe> _costRecipes;
+    std::unordered_map<uint32_t, std::vector<const CostRecipe*>> _costProducers;
 };
 
 #define sCMangosAHBot CMangosAHBot::instance()

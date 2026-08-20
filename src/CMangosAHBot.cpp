@@ -179,6 +179,219 @@ void CMangosAHBot::CraftStartupDiagnostics()
     }
     // Restore the live mask.
     _craftGraph.RecomputeMask(_caps, cfg.progTbcAtState, cfg.progWotlkAtState, cfg.progSkillCaps);
+
+    // C2 hand-check: cost the real graph (5 representative chains + cycle stats).
+    std::istringstream ss(CraftCostChains(0));
+    std::string line;
+    while (std::getline(ss, line))
+        LOG_INFO("module", "{}", line);
+}
+
+// ===========================================================================
+// Cost engine facade (crafting addendum §3 / §10.2)
+// ===========================================================================
+
+namespace
+{
+    // Concrete IRecipeSource over the singleton's projected producer index.
+    struct ProjSource : IRecipeSource
+    {
+        const std::unordered_map<uint32_t, std::vector<const CostRecipe*>>& producers;
+        std::vector<const CostRecipe*> empty;
+        explicit ProjSource(const std::unordered_map<uint32_t, std::vector<const CostRecipe*>>& p)
+            : producers(p) {}
+        const std::vector<const CostRecipe*>& Producers(uint32_t itemId) const override
+        {
+            auto it = producers.find(itemId);
+            return it == producers.end() ? empty : it->second;
+        }
+    };
+
+    // Median of live bot listings, clamped to [min,max]% of the intrinsic formula;
+    // falls back to intrinsic when nothing is listed (§3.1). intrinsic() is the
+    // module's CalculateBuyoutPrice, passed in as a function to keep it private.
+    struct LiveAnchor : IMarketAnchor
+    {
+        const std::unordered_map<uint32_t, uint64_t>& medians;
+        std::function<uint64_t(uint32_t)> intrinsic;
+        uint32_t clampMinPct, clampMaxPct;
+        LiveAnchor(const std::unordered_map<uint32_t, uint64_t>& m,
+                   std::function<uint64_t(uint32_t)> f, uint32_t lo, uint32_t hi)
+            : medians(m), intrinsic(std::move(f)), clampMinPct(lo), clampMaxPct(hi) {}
+        uint64_t Anchor(uint32_t itemId) const override
+        {
+            uint64_t intr = intrinsic(itemId);
+            auto it = medians.find(itemId);
+            if (it == medians.end())
+                return intr > 0 ? intr : 1; // nothing listed -> intrinsic (floor 1)
+            uint64_t med = it->second;
+            if (intr == 0)
+                return med > 0 ? med : 1;
+            uint64_t lo = intr * clampMinPct / 100;
+            uint64_t hi = intr * clampMaxPct / 100;
+            return std::min(std::max(med, lo), hi);
+        }
+    };
+
+    // Margin band per rarity (production), cooldown bonus folded in.
+    std::pair<uint32_t, uint32_t> MarginBand(uint8_t rarity, bool cd)
+    {
+        const auto& c = gCMangosAHBotConfig;
+        uint32_t lo, hi;
+        switch (rarity)
+        {
+            case 0:  lo = c.craftMarginTrainerMin; hi = c.craftMarginTrainerMax; break; // TRAINER
+            case 1:  lo = c.craftMarginVendorMin;  hi = c.craftMarginVendorMax;  break; // VENDOR
+            default: lo = c.craftMarginDropMin;    hi = c.craftMarginDropMax;    break; // DROP/UNSOURCED
+        }
+        if (cd) { lo = lo * c.craftMarginCooldownBonus / 100; hi = hi * c.craftMarginCooldownBonus / 100; }
+        return { lo, hi };
+    }
+
+    struct LiveMargins : IMarginModel
+    {
+        uint32_t ProductionMarginPct(const CostRecipe& r) const override
+        {
+            auto [lo, hi] = MarginBand(r.rarity, r.dailyCooldown);
+            return sCMangosAHBotRng->Urand(lo, hi);
+        }
+        uint32_t LevelingMarginPct() const override
+        {
+            return sCMangosAHBotRng->Urand(gCMangosAHBotConfig.craftMarginLevelingMin,
+                                           gCMangosAHBotConfig.craftMarginLevelingMax);
+        }
+    };
+}
+
+void CMangosAHBot::BuildCostProjection()
+{
+    _costRecipes.clear();
+    _costProducers.clear();
+    if (!_craftBuilt)
+        return;
+
+    // Fill fully first (so pointers stay valid), then index available producers.
+    const auto& recipes = _craftGraph.Recipes();
+    _costRecipes.reserve(recipes.size());
+    for (const CraftRecipe& g : recipes)
+    {
+        CostRecipe c;
+        c.productItem   = g.productItem;
+        c.productCount  = g.productCount;
+        c.reagents      = g.reagents;
+        c.rarity        = static_cast<uint8_t>(g.rarity);
+        c.available     = g.available;
+        c.dailyCooldown = g.dailyCooldown;
+        _costRecipes.push_back(std::move(c));
+    }
+    for (const CostRecipe& c : _costRecipes)
+        if (c.available)
+            _costProducers[c.productItem].push_back(&c);
+}
+
+void CMangosAHBot::BuildAnchorMedians(std::unordered_map<uint32_t, uint64_t>& out) const
+{
+    out.clear();
+    AuctionHouseObject* ah = sAuctionMgr->GetAuctionsMap(CMAHB_AH_FIDS[CMAHB_HOUSE_NEUTRAL]);
+    if (!ah)
+        return;
+    std::unordered_map<uint32_t, std::vector<uint64_t>> perUnit;
+    for (auto it = ah->GetAuctionsBegin(); it != ah->GetAuctionsEnd(); ++it)
+    {
+        AuctionEntry* a = it->second;
+        if (!a || a->owner.GetCounter() != gCMangosAHBotConfig.guid || a->buyout == 0 || a->itemCount == 0)
+            continue;
+        perUnit[a->item_template].push_back(uint64_t(a->buyout) / a->itemCount);
+    }
+    for (auto& [item, v] : perUnit)
+    {
+        std::sort(v.begin(), v.end());
+        out[item] = v[v.size() / 2]; // median (upper-middle for even counts)
+    }
+}
+
+std::string CMangosAHBot::CraftCostChains(uint32_t sampleN) const
+{
+    std::ostringstream ss;
+    if (!_craftBuilt || _costRecipes.empty())
+        return "Craft cost engine: no projection (craft disabled).";
+
+    std::unordered_map<uint32_t, uint64_t> medians;
+    BuildAnchorMedians(medians);
+
+    ProjSource src(_costProducers);
+    LiveAnchor anchor(medians, [this](uint32_t id) -> uint64_t {
+        ItemTemplate const* p = sObjectMgr->GetItemTemplate(id);
+        return p ? CalculateBuyoutPrice(p) : 0;
+    }, gCMangosAHBotConfig.craftAnchorClampMin, gCMangosAHBotConfig.craftAnchorClampMax);
+    LiveMargins margins;
+    CMangosAHBotCost cost(src, anchor);
+
+    auto nameOf = [](uint32_t id) -> std::string {
+        ItemTemplate const* p = sObjectMgr->GetItemTemplate(id);
+        return p ? p->Name1 : std::string("item#") + std::to_string(id);
+    };
+    auto describe = [&](const char* label, const CraftRecipe* r)
+    {
+        if (!r) { ss << "\n  " << label << ": (none available at state " << int(_caps.state) << ")"; return; }
+        cost.NewPass();
+        uint64_t c = 0;
+        std::ostringstream mats;
+        for (auto& [rid, rc] : r->reagents)
+        {
+            uint64_t mv = cost.MatValue(rid);
+            c += mv * rc;
+            mats << nameOf(rid) << " x" << rc << "@" << mv << " ";
+        }
+        c = r->productCount ? c / r->productCount : c;
+        auto [mlo, mhi] = MarginBand(static_cast<uint8_t>(r->rarity), r->dailyCooldown);
+        ss << "\n  " << label << ": " << nameOf(r->productItem) << " x" << r->productCount
+           << " <= " << mats.str() << "| cost/unit=" << c
+           << " rarity=" << RarityName(r->rarity)
+           << " margin=" << mlo << "-" << mhi << "% price=" << (c * mlo / 100) << "-" << (c * mhi / 100)
+           << (r->dailyCooldown ? " [CD]" : "");
+    };
+
+    // Pick 5 representative real chains from available recipes.
+    const CraftRecipe *bar=nullptr,*bolt=nullptr,*flask=nullptr,*transmute=nullptr,*epic=nullptr;
+    for (const CraftRecipe& r : _craftGraph.Recipes())
+    {
+        if (!r.available) continue;
+        if (!bar && r.skillLine == SKILL_MINING && !r.reagents.empty()) bar = &r;
+        if (!bolt && r.category == CAT_INTERMEDIATE && r.skillLine == SKILL_TAILORING) bolt = &r;
+        if (!flask && r.category == CAT_FLASK) flask = &r;
+        if (!transmute && r.dailyCooldown) transmute = &r;
+        if (!epic && r.category == CAT_GEAR && r.reagents.size() >= 3) epic = &r;
+    }
+    ss << "CMangosAHBot[craft]: cost hand-check (state=" << int(_caps.state)
+       << ", anchor medians for " << medians.size() << " items):";
+    describe("bar<-ore ", bar);
+    describe("bolt<-cloth", bolt);
+    describe("flask<-herb", flask);
+    describe("transmute ", transmute);
+    describe("epic-gear ", epic);
+
+    // Full-graph pass to prove no recursion blowups + count cycles (§3.1 requirement).
+    cost.NewPass();
+    uint32_t n = 0, limit = sampleN ? sampleN : uint32_t(_costRecipes.size());
+    for (const CostRecipe& r : _costRecipes)
+    {
+        if (!r.available) continue;
+        if (n++ >= limit) break;
+        cost.MatValue(r.productItem);
+    }
+    ss << "\nCMangosAHBot[craft]: full-graph cost pass — priced " << n
+       << " products, cycleHits=" << cost.CycleHits()
+       << " depthHits=" << cost.DepthHits()
+       << " memo=" << cost.MemoSize();
+    return ss.str();
+}
+
+std::string CMangosAHBot::CraftSimulateCost(uint32_t n) const
+{
+    if (!gCMangosAHBotConfig.craftEnable || !_craftBuilt)
+        return "Craft layer disabled (Craft.Enable=0).";
+    return CraftCostChains(n);
 }
 
 void CMangosAHBot::ReloadData()
@@ -477,6 +690,7 @@ void CMangosAHBot::RefreshProgression(bool force)
         if (_craftBuilt)
         {
             _craftGraph.RecomputeMask(_caps, cfg.progTbcAtState, cfg.progWotlkAtState, cfg.progSkillCaps);
+            BuildCostProjection();
             LOG_INFO("module", "CMangosAHBot[craft]: mask recomputed for state {} — available {}/{} recipes "
                      "(JC={} Inscription={}).", _caps.state, _craftGraph.AvailableCount(), _craftGraph.Size(),
                      _craftGraph.SkillLineAvailableCount(SKILL_JEWELCRAFTING),
