@@ -392,3 +392,39 @@ state=18 WotLK:   FLASK=14 ELIXIR=8  FOOD=1 BAG=16 GEM_CUT=6 GEAR=0 INTERMEDIATE
 - **Override table §8.2:** additive `craft_weight`/`craft_margin` columns shipped in
   `data/sql/db-characters/cmangos_ahbot_items_craft.sql` (idempotent `ADD COLUMN IF NOT EXISTS`,
   MariaDB), loaded and applied in the production chooser/margin.
+
+---
+
+# Phase C5 — buyer integration + demand ledger (§6)
+
+Extends the base Phase-6 buyer: sessions credit a rolling **demand ledger** (mats consumed by
+crafters, §6.1); the buyer values crafted goods at their **make cost** (§6.3) and ledger-demanded
+mats at **MatValue** (§6.2) — both through the SAME cost engine (buyer coherence, #2) — scaled by a
+**saturation curve** (§6.4). All gated behind `Craft.Enable`, so with it off the buyer is byte-identical
+to the base module (#1). The deferred-buyout vector (base §6.2) is preserved and now feeds both
+valuation paths. Offline tests **47/47** (added saturation endpoints: 100% ≤cap, 65% @2cap, 30% @3cap).
+
+**Runtime verification (live Update loop, `Craft.TestCommands=1`, `Chance.Buy=100`, seed 12345).** The
+buyer only runs correctly during `Update()` — `OnStartup` fires *before* "World initialized" so buyouts
+don't complete there (a test-harness artifact, not a buyer bug; the in-startup attempt was flaky). So
+the self-test **creates** synthetic non-bot auctions (`craft testlist`, §8.3) and lets the live buy
+passes consume them; verified by polling `auctionhouse`:
+
+```
+TEST-A  mat 15994, MatValue 7011, ask 3154/u (< buyer val 6309/u): bought within ~3 buy passes; ledger debited 1000->980.
+TEST-B  item 4358 (craftCost 40), ask 25/u, listed 60, DailyCap 20:
+        bought EXACTLY 38 then stopped (== predicted 2x-cap saturation cutoff); 22 left unbought.
+        BuyPass: queuedBuyouts=39 executed=39 in one pass (deferred-buyout, no iterator invalidation).
+```
+
+**Acceptance:**
+- Ledger-demanded mat bought within 3 passes + ledger debited ✅
+- Saturation: first ~DailyCap near full valuation, tail decays and buying stops at the curve cutoff
+  (38 = 2×cap for these params) ✅
+- Deferred buyout, no iterator invalidation, no crash ✅
+- Buyer coherence: crafted/mat valuations both via the cost engine (`craftCostOf`/`MatValue`) ✅
+- `Craft.Enable=0` ⇒ base world-drop buying unchanged (valuation branch gated on `craftVal`) ✅
+
+**Notes:** saturation must engage **within** a single buy pass (buyouts are deferred, so `_ledgerBought`
+only updates after the loop) — a per-pass `localBought` counter feeds the in-loop valuation. Cleaned up
+leftover test auctions via SQL after verification; live server restored (craft off).
