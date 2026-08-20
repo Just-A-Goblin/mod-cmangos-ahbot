@@ -428,3 +428,33 @@ TEST-B  item 4358 (craftCost 40), ask 25/u, listed 60, DailyCap 20:
 **Notes:** saturation must engage **within** a single buy pass (buyouts are deferred, so `_ledgerBought`
 only updates after the loop) — a per-pass `localBought` counter feeds the in-loop valuation. Cleaned up
 leftover test auctions via SQL after verification; live server restored (craft off).
+
+---
+
+# Phase C6 — market texture (§7)
+
+Listing-time texture: stacks (§7.2) spread across a 2-4 rung undercut ladder (§7.1), floored. Pure,
+offline-tested (`SplitStacks`, `TexturedListings`); offline **55/55** (stack rules per category,
+2-4 rung ladder, floor clamp). `CraftSellPass` now: (1) computes the cheapest existing bot buyout/unit
+per item in the house and undercuts it by ×urand(95,99)% (cross-pass §7.1); (2) floors at 100% of mat
+cost (producing) / 60% (leveling dumps); (3) splits each listing via `TexturedListings`.
+
+**Texture sample (state 0, seed 12345):**
+```
+INTERMEDIATE Rough Blasting Powder matcost 12: stacks[20 20 5 15] (full + ragged)  prices 2 rungs  >=floor
+FLASK        Flask of the Titans  matcost 16860: stacks[20 20 5 5 5 5] (mixed 20s/5s) prices 2 rungs >=floor
+GEAR         Rough Boomstick      matcost 360: 60 singles, prices 698/691/684/649 = 4-rung ladder  >=floor
+BAG          Linen Bag            matcost 366: 60 singles, prices 702/694/659/639 = 4-rung ladder  >=floor
+AMMO         Crafted Light Shot   matcost 1: full stack (§7.2)
+```
+
+**Acceptance:**
+- 2-4 rung price ladder on high-volume items ✅ (GEAR/BAG 4 rungs, consumables/intermediates 2)
+- No bot listing below its floor ✅ (`aboveFloor=yes` for every category)
+- Stack-size mix per §7.2 ✅ (GEAR/BAG singles, AMMO full stacks, FLASK/ELIXIR/FOOD mixed 5s/20s,
+  INTERMEDIATE full + ragged)
+- Cross-era sentinels still gated; no crash ✅
+
+Design note: the 2-4 price points ARE the ladder (§7.2 "via variance + one undercut step") — variance
+jitters the top rung once and each lower rung is one undercut step below, floored; stacks spread across
+rungs with no extra per-stack jitter (else a wall of near-dupes instead of a clean ladder).
