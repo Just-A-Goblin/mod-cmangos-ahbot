@@ -310,6 +310,31 @@ int main()
     checkEq(CraftSim::SaturationMultPct(40, 20, 30), 65, "saturation: midpoint (2x cap) = 65%");
     checkEq(CraftSim::SaturationMultPct(10, 0, 30), 100, "saturation: cap 0 => neutral 100%");
 
+    // 20. Stack split by category (§7.2).
+    { auto s = CraftSim::SplitStacks(5, CAT_GEAR, 20, rng);
+      bool allOne = s.size()==5; for (auto x : s) if (x!=1) allOne=false;
+      check(allOne, "GEAR -> 5 single stacks"); }
+    { auto s = CraftSim::SplitStacks(500, CAT_AMMO, 200, rng);
+      uint32_t sum=0; bool full=true; for (size_t i=0;i<s.size();++i){ sum+=s[i]; if(i+1<s.size() && s[i]!=200) full=false; }
+      check(sum==500 && full, "AMMO -> full 200-stacks summing to 500"); }
+    { auto s = CraftSim::SplitStacks(30, CAT_FLASK, 20, rng);
+      uint32_t sum=0; bool sizesOk=true; for (auto x : s){ sum+=x; if(x!=5 && x!=20 && x>20) sizesOk=false; }
+      check(sum==30 && sizesOk, "FLASK -> mixed 5s/20s summing to 30"); }
+    { auto s = CraftSim::SplitStacks(250, CAT_INTERMEDIATE, 200, rng);
+      uint32_t sum=0; for (auto x : s) sum+=x;
+      check(sum==250 && s.size()>=2, "INTERMEDIATE -> full stack(s) + ragged, summing to 250"); }
+
+    // 21. Textured listings (§7): 2-4 rungs, per-stack variance, never below floor.
+    { auto t = CraftSim::TexturedListings(5, CAT_GEAR, 20, 1000, 500, 10, rng);
+      check(t.size()==5, "GEAR texture -> 5 single listings");
+      std::vector<uint64_t> distinct; bool floorOk=true;
+      for (auto& [st,pr] : t){ if(pr<500) floorOk=false; bool seen=false; for(auto d:distinct) if(d==pr) seen=true; if(!seen) distinct.push_back(pr); }
+      check(floorOk, "no textured price below floor");
+      check(distinct.size()>=2 && distinct.size()<=5, "GEAR shows a 2-4 rung ladder"); }
+    { auto t = CraftSim::TexturedListings(10, CAT_AMMO, 200, 40, 100, 10, rng); // basePrice < floor
+      bool floorOk=true; for (auto& [st,pr] : t) if (pr<100) floorOk=false;
+      check(floorOk, "basePrice below floor -> all listings clamped to floor"); }
+
     std::printf("CRAFT-TESTS: %s  (%d passed, %d failed)\n",
                 g_fail==0 ? "PASS" : "FAIL", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

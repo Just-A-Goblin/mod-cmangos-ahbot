@@ -186,6 +186,61 @@ namespace CraftSim
         }
     }
 
+    std::vector<uint32_t> SplitStacks(uint32_t count, uint8_t category, uint32_t maxStack,
+                                      std::mt19937& rng)
+    {
+        std::vector<uint32_t> out;
+        if (count == 0) return out;
+        if (maxStack == 0) maxStack = 1;
+        auto u = [&](uint32_t a, uint32_t b) { return std::uniform_int_distribution<uint32_t>(a, b)(rng); };
+
+        switch (category)
+        {
+            case CAT_GEAR: case CAT_BAG: case CAT_GEM_CUT: // singles
+                for (uint32_t i = 0; i < count; ++i) out.push_back(1);
+                break;
+            case CAT_FLASK: case CAT_ELIXIR_POT: case CAT_FOOD: // mixed 5s and 20s
+                while (count > 0)
+                { uint32_t s = std::min({ count, maxStack, (u(0, 1) ? 20u : 5u) }); if (s == 0) s = count;
+                  out.push_back(s); count -= s; }
+                break;
+            case CAT_INTERMEDIATE: // full stacks + one ragged partial
+                while (count > maxStack) { out.push_back(maxStack); count -= maxStack; }
+                if (count > 0) out.push_back(count > 1 ? u(1, count) : count);
+                if (count > 0 && out.back() < count) out.push_back(count - out.back());
+                break;
+            default: // AMMO / MISC / SCROLL: full stacks
+                while (count > 0) { uint32_t s = std::min(count, maxStack); out.push_back(s); count -= s; }
+                break;
+        }
+        return out;
+    }
+
+    std::vector<std::pair<uint32_t, uint64_t>> TexturedListings(
+        uint32_t count, uint8_t category, uint32_t maxStack, uint64_t basePrice,
+        uint64_t floor, uint32_t variancePct, std::mt19937& rng)
+    {
+        std::vector<std::pair<uint32_t, uint64_t>> out;
+        std::vector<uint32_t> stacks = SplitStacks(count, category, maxStack, rng);
+        if (stacks.empty()) return out;
+        auto u = [&](uint32_t a, uint32_t b) { return std::uniform_int_distribution<uint32_t>(a, b)(rng); };
+
+        // 2-4 price points = the ladder (§7.2 "via variance + one undercut step"): the
+        // top rung is basePrice jittered by variance, each lower rung one undercut step
+        // below, floored (§7.1). Stacks are spread across the rungs — no extra per-stack
+        // jitter, so browsing shows a clean 2-4 rung ladder, not a wall of near-dupes.
+        uint32_t rungCount = std::min<uint32_t>(stacks.size(), u(2, 4));
+        uint32_t v = std::min(99u, variancePct);
+        std::vector<uint64_t> rung(rungCount);
+        rung[0] = std::max<uint64_t>(floor, v ? basePrice * u(100 - v, 100 + v) / 100 : basePrice);
+        for (uint32_t i = 1; i < rungCount; ++i)
+            rung[i] = std::max<uint64_t>(floor, rung[i - 1] * u(95, 99) / 100);
+
+        for (size_t k = 0; k < stacks.size(); ++k)
+            out.emplace_back(stacks[k], rung[k % rungCount]);
+        return out;
+    }
+
     std::vector<Crafter> RollPopulation(uint32_t size,
                                         const std::vector<std::pair<uint32_t, uint32_t>>& weights,
                                         uint16_t cap, double alpha, double beta,

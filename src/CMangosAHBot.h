@@ -104,6 +104,7 @@ private:
                      std::unordered_map<uint32_t, uint32_t>* ledgerCredit = nullptr);
     void CraftSellPass(Player* bot, uint32_t houseIdx); // real sessions -> posted listings
     void CraftDemandSweep();  // C4: production category-mix across probe states (logged)
+    void CraftTextureSample(); // C6: stack/price-point texture per category (logged)
 
     // Simulation (Phase 4)
     void AddLootToItemMap(Player* bot, CmAHBItemMap& out);

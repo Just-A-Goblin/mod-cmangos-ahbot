@@ -272,6 +272,9 @@ void CMangosAHBot::CraftStartupDiagnostics()
     // C4 hand-check: demand-weighted production mix across eras.
     CraftDemandSweep();
 
+    // C6 hand-check: stack/price-point texture per category.
+    CraftTextureSample();
+
     // C5 hand-check: buyer (ledger buy + saturation). Gated by Craft.TestCommands
     // (mutates the AH with synthetic auctions, then cleans up).
     CraftBuyerSelfTest();
@@ -549,6 +552,50 @@ std::string CMangosAHBot::CraftTestList(uint32_t itemId, uint32_t count, uint32_
         CharacterDatabase.CommitTransaction(trans);
     });
     return "created " + std::to_string(created) + " test auction(s), owner guid " + std::to_string(owner);
+}
+
+void CMangosAHBot::CraftTextureSample()
+{
+    const auto& cfg = gCMangosAHBotConfig;
+    if (!_craftBuilt) return;
+
+    std::unordered_map<uint32_t, uint64_t> medians; BuildAnchorMedians(medians);
+    ProjSource src(_costProducers);
+    LiveAnchor anchor(medians, [this](uint32_t id) -> uint64_t {
+        ItemTemplate const* p = sObjectMgr->GetItemTemplate(id); return p ? CalculateBuyoutPrice(p) : 0;
+    }, cfg.craftAnchorClampMin, cfg.craftAnchorClampMax);
+    CMangosAHBotCost cost(src, anchor); cost.NewPass();
+
+    LOG_INFO("module", "CMangosAHBot[craft]: texture sample (stacks §7.2 + 2-4 rung ladder §7.1, floor-respecting):");
+    const ItemCategory cats[] = { CAT_INTERMEDIATE, CAT_AMMO, CAT_FLASK, CAT_GEAR, CAT_BAG };
+    for (ItemCategory cat : cats)
+    {
+        const CraftRecipe* pick = nullptr;
+        for (auto& [sl, recs] : _craftCandidates)
+        { for (const CraftRecipe* r : recs) if (r->available && r->category == cat) { pick = r; break; } if (pick) break; }
+        if (!pick) continue;
+
+        uint64_t matcost = std::max<uint64_t>(1, CraftSim::MatCost(*pick, cost));
+        ItemTemplate const* proto = sObjectMgr->GetItemTemplate(pick->productItem);
+        uint32_t maxStack = proto ? std::max(1u, uint32_t(proto->GetMaxStackSize())) : 1u;
+        uint32_t count = 60;
+        uint64_t basePrice = matcost * 2;           // ~200% margin (typical producing recipe)
+        uint64_t floor = matcost;                   // producing floor
+        auto tl = CraftSim::TexturedListings(count, uint8_t(cat), maxStack, basePrice, floor,
+                                             cfg.valueVariance, sCMangosAHBotRng->Engine());
+
+        std::string sizes, prices; std::vector<uint64_t> distinct; bool allAbove = true;
+        for (size_t i = 0; i < tl.size(); ++i)
+        {
+            if (i < 8) { sizes += std::to_string(tl[i].first) + " "; prices += std::to_string(tl[i].second) + " "; }
+            if (tl[i].second < floor) allAbove = false;
+            bool seen = false; for (uint64_t d : distinct) if (d == tl[i].second) seen = true;
+            if (!seen) distinct.push_back(tl[i].second);
+        }
+        LOG_INFO("module", "  {} '{}' matcost={} floor={} -> {} listings, stacks[{}], prices[{}] "
+                 "distinctPrices={} aboveFloor={}", CategoryName(cat), proto ? proto->Name1 : "?",
+                 matcost, floor, tl.size(), sizes, prices, distinct.size(), allAbove ? "yes" : "NO");
+    }
 }
 
 void CMangosAHBot::CraftBuyerSelfTest()
@@ -883,6 +930,7 @@ void CMangosAHBot::RunSessions(std::vector<Crafter>& pop, uint32_t n, CMangosAHB
 
         const CraftRecipe* r = nullptr;
         uint32_t batch = 0, marginPct = 0;
+        const bool isLeveling = cr.leveling();
 
         if (cr.leveling())
         {
@@ -939,6 +987,7 @@ void CMangosAHBot::RunSessions(std::vector<Crafter>& pop, uint32_t n, CMangosAHB
         L.unitMatCost = matcost;
         L.skillLine   = r->skillLine;
         L.category    = static_cast<uint8_t>(r->category);
+        L.leveling    = isLeveling;
         out.push_back(L);
     }
 }
@@ -979,6 +1028,17 @@ void CMangosAHBot::CraftSellPass(Player* bot, uint32_t houseIdx)
     if (listings.empty())
         return;
 
+    // §7.1 undercut: cheapest existing bot buyout-per-unit for each item in this house.
+    std::unordered_map<uint32_t, uint64_t> existingMin;
+    for (auto it = auctionHouse->GetAuctionsBegin(); it != auctionHouse->GetAuctionsEnd(); ++it)
+    {
+        AuctionEntry* a = it->second;
+        if (!a || a->owner != bot->GetGUID() || a->buyout == 0 || a->itemCount == 0) continue;
+        uint64_t pu = uint64_t(a->buyout) / a->itemCount;
+        auto e = existingMin.find(a->item_template);
+        if (e == existingMin.end() || pu < e->second) existingMin[a->item_template] = pu;
+    }
+
     auto trans = CharacterDatabase.BeginTransaction();
     uint32_t posted = 0;
     for (const CraftListing& L : listings)
@@ -993,16 +1053,19 @@ void CMangosAHBot::CraftSellPass(Player* bot, uint32_t houseIdx)
             ++_layer3Dropped;
             continue;
         }
-        uint64_t unit = ValueWithVariance(L.unitPrice);
-        if (unit == 0)
-            continue;
+        // §7: floor (leveling dumps 60% of mat cost, producing 100%), undercut base
+        // price if we already list this item here, then texture into stacks + rungs.
+        uint64_t floor = std::max<uint64_t>(1, L.leveling ? L.unitMatCost * 60 / 100 : L.unitMatCost);
+        uint64_t basePrice = L.unitPrice;
+        if (auto ex = existingMin.find(L.itemId); ex != existingMin.end() && ex->second > 0)
+            basePrice = ex->second * sCMangosAHBotRng->Urand(95, 99) / 100;
+        basePrice = std::max(basePrice, floor);
 
         uint32_t maxStack = std::max(1u, static_cast<uint32_t>(proto->GetMaxStackSize()));
-        uint32_t remaining = L.count;
-        while (remaining > 0)
+        auto textured = CraftSim::TexturedListings(L.count, uint8_t(L.category), maxStack, basePrice,
+                                                   floor, cfg.valueVariance, sCMangosAHBotRng->Engine());
+        for (auto& [stack, unit] : textured)
         {
-            uint32_t stack = std::min(remaining, maxStack);
-            remaining -= stack;
             uint64_t buyout64 = unit * stack;
             uint32_t buyout = buyout64 > NOCAP ? NOCAP : static_cast<uint32_t>(buyout64);
             if (buyout == 0)

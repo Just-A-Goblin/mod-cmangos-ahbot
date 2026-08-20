@@ -42,6 +42,7 @@ struct CraftListing
     uint64_t unitMatCost = 0;
     uint32_t skillLine = 0;
     uint8_t  category  = CAT_MISC;
+    bool     leveling  = false; // leveling dump (floor 60% of matcost) vs producing (100%)
 };
 
 namespace CraftSim
@@ -102,4 +103,17 @@ namespace CraftSim
     // `cap` units bought in the window, then linear decay to `floorMultPct` at 3*cap
     // (dump 100 flasks -> price crashes). Caps the gold faucet with one mechanism.
     uint32_t SaturationMultPct(uint32_t bought, uint32_t cap, uint32_t floorMultPct);
+
+    // Split a listing's total count into category-appropriate stack sizes (§7.2):
+    // GEAR/BAG/GEM_CUT singles; AMMO full stacks; FLASK/ELIXIR_POT/FOOD mixed 5s/20s;
+    // INTERMEDIATE full stacks + one ragged partial; else full stacks.
+    std::vector<uint32_t> SplitStacks(uint32_t count, uint8_t category, uint32_t maxStack,
+                                      std::mt19937& rng);
+
+    // Texture a listing (§7): stacks (§7.2) spread across 2-4 undercut price rungs
+    // (§7.1), each with per-stack variance, never below `floor`. `basePrice` is the
+    // top rung (the CraftPrice, or the in-house undercut). Returns (stackSize, unitPrice).
+    std::vector<std::pair<uint32_t, uint64_t>> TexturedListings(
+        uint32_t count, uint8_t category, uint32_t maxStack, uint64_t basePrice,
+        uint64_t floor, uint32_t variancePct, std::mt19937& rng);
 }
