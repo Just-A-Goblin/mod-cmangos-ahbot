@@ -55,6 +55,10 @@ public:
     // Runaway guard only — NOT a setpoint (plan §7). 0 = unlimited.
     uint32_t hardCap = 0;
 
+    // `.cmahbot rebuild` prefill passes per house (each posts a full loot itemMap +
+    // craft batch). Higher = fuller initial fill but a longer world-thread pause.
+    uint32_t rebuildPasses = 8;
+
     // -------- Progression (addendum §6) --------
     uint32_t progEnable   = 1;
     uint32_t progSource   = CMAHB_PROG_ACCOUNT;

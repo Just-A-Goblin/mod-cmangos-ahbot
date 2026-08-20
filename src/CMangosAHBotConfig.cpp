@@ -126,6 +126,8 @@ void CMangosAHBotConfig::Load()
     timeMax  = sConfigMgr->GetOption<uint32_t>("CMangosAHBot.Time.Max",  24);
 
     hardCap  = sConfigMgr->GetOption<uint32_t>("CMangosAHBot.HardCap", 0);
+    // Clamp [1,200]: 0 would post nothing; a huge value would freeze the world thread.
+    rebuildPasses = std::min(200u, std::max(1u, sConfigMgr->GetOption<uint32_t>("CMangosAHBot.RebuildPasses", 8)));
 
     // -------- Progression --------
     progEnable    = sConfigMgr->GetOption<uint32_t>("CMangosAHBot.Progression.Enable", 1);

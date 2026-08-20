@@ -93,6 +93,12 @@ CMangosAHBot.Time.Max  = 24
 # when the bot already owns more than this many auctions there.
 CMangosAHBot.HardCap = 0
 
+# `.cmahbot rebuild` prefill passes per house. Each pass posts a full simulated loot
+# itemMap (+ a craft batch when Craft.Enable=1), so total initial fill scales roughly
+# linearly with this. Higher = fuller AH immediately, but a longer world-thread pause
+# during the rebuild command. Clamped to 1..200. Hot-reloadable with `.reload config`.
+CMangosAHBot.RebuildPasses = 8
+
 ########################################
 # Progression gating (addendum). Requires mod-individual-progression for a live
 # state; with IP absent the query returns nothing => state 0 (Vanilla), or set

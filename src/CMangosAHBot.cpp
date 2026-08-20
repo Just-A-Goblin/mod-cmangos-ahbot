@@ -2253,10 +2253,9 @@ void CMangosAHBot::Rebuild(bool /*all*/, uint32_t forHouse)
 
     // Unlike CMaNGOS (whose per-pass output is tiny), each SellPass here posts the
     // whole filtered itemMap — hundreds to low-thousands of auctions. A handful of
-    // passes fills a realistic AH, so we cap hard: a large count would both freeze
-    // the world thread and (previously) crash via a long-lived transient player.
-    (void)cfg;
-    const uint32_t passes = 8;
+    // passes fills a realistic AH; CMangosAHBot.RebuildPasses (clamped 1..200) tunes
+    // the initial fill vs the world-thread pause during the command.
+    const uint32_t passes = cfg.rebuildPasses;
 
     for (uint32_t p = 0; p < passes; ++p)
         for (uint32_t h = 0; h < CMAHB_HOUSE_COUNT; ++h)
