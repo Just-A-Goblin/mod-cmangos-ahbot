@@ -351,3 +351,44 @@ monotonic (state 0/8/13/18 → 1088/1892/2798/2885 available).
 Remaining for later: ammo over-dominates raw counts (high `productCount`); smelted-bar volume is
 understated in the *startup* snapshot because some mats have no live median at `OnStartup` (0 matcost
 inflates 0-cost recipes) — a measurement/tuning item for **C7**, not a mechanism bug.
+
+---
+
+# Phase C4 — demand-weighted production
+
+Adds §5 production sessions for at-cap crafters (leveling stays for below-cap). Offline tests now
+**41/41** (added the production chooser: category weights steer selection, GEAR ilvl-window gates,
+override-weight 0 forbids).
+
+**Demand sweep (all-at-cap population, 1500 production sessions/state, seed 12345), by listing share:**
+```
+state=0  Vanilla: FLASK=11 ELIXIR=13 FOOD=7 BAG=11 AMMO=7 GEAR=8 INTERMEDIATE=36 MISC=3  | GEAR ilvl [41..66]  window[40..66]
+state=7  Vanilla: FLASK=7  ELIXIR=12 FOOD=5 BAG=16 AMMO=6 GEAR=0 INTERMEDIATE=44 MISC=6  | GEAR ilvl [70..72]  window[66..92]
+state=8  TBC:     FLASK=9  ELIXIR=14 FOOD=5 BAG=15 GEM_CUT=4 GEAR=10 INTERMEDIATE=35 MISC=4 | GEAR ilvl [93..115] window[89..115]
+state=13 WotLK:   FLASK=10 ELIXIR=7  FOOD=3 BAG=16 GEM_CUT=7 GEAR=4 INTERMEDIATE=41 MISC=7 | GEAR ilvl [183..200] window[174..200] | CD=4/1recipe
+state=18 WotLK:   FLASK=14 ELIXIR=8  FOOD=1 BAG=16 GEM_CUT=6 GEAR=0 INTERMEDIATE=43 MISC=7 | GEAR ilvl [264..264] window[258..284] | CD=4/1recipe
+```
+
+**Acceptance:**
+- **Category mix shifts per era** ✅ — AMMO is Vanilla-only (weight 0 in TBC/WotLK); **GEM_CUT appears
+  only from TBC** (0→4→7→6); FLASK/ELIXIR/FOOD/BAG/GEAR/INTERMEDIATE track their weights.
+- **GEAR clusters inside the ilvl window** ✅ — at every state the GEAR ilvl range sits inside
+  `[ilvlCap-GearWindow, ilvlCap]` (e.g. state 13: [183..200] ⊂ [174..200]).
+- **CD products ≤ §4.5 cap** ✅ — bounded (4 crafts on the detected recipe); mechanism works.
+- **Cross-era crafted sentinels absent** ✅ (regression from C3 holds).
+
+**Design decisions / caveats:**
+- **Category-weight normalization (refines §5.2):** each category's weight is split across its available
+  recipes, so a category's *selection share* tracks the configured weight regardless of recipe count
+  (else 40 elixir recipes bury 4 flask recipes → FLASK read 0%). The sweep reports by **listings** (not
+  units) because units are dominated by high-`productCount` categories (ammo) and hide the weights.
+- **CD detection remains ≈1 recipe (C1/C-A5 limitation, confirmed):** `spell_dbc` (SQL) is a 4518-row
+  override subset with zero ≥24h cooldowns, so transmute/Titansteel dailies live only in the real
+  `Spell.dbc` and are enforced via triggered-spell/category indirection not exposed on the create-item
+  spell's `RecoveryTime`. The §4.5 **cap mechanism is implemented and demonstrably bounds output**; only
+  the detected set is small. Refining detection (mapping triggered→trigger spells) is a future item.
+- **SCROLL category dropped as inert (C-A9 follow-up):** enchant scrolls are `ENCHANT_ITEM`-on-vellum,
+  not create-item spells, so the `SCROLL` demand weight has no supply. Logged at startup; not synthesized.
+- **Override table §8.2:** additive `craft_weight`/`craft_margin` columns shipped in
+  `data/sql/db-characters/cmangos_ahbot_items_craft.sql` (idempotent `ADD COLUMN IF NOT EXISTS`,
+  MariaDB), loaded and applied in the production chooser/margin.
