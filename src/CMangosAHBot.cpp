@@ -30,6 +30,8 @@
 #include "Random.h"
 #include "Log.h"
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <cstdio>
 #include <ctime>
 #include <limits>
@@ -274,6 +276,11 @@ void CMangosAHBot::CraftStartupDiagnostics()
 
     // C6 hand-check: stack/price-point texture per category.
     CraftTextureSample();
+
+    // C7: per-pass timing budget, and (for the soak driver) a craft-dump CSV.
+    CraftTimingBench();
+    if (!cfg.craftDumpFile.empty())
+        LOG_INFO("module", "CMangosAHBot[craft]: {}", CraftDump(cfg.craftDumpFile, /*liveAH=*/false));
 
     // C5 hand-check: buyer (ledger buy + saturation). Gated by Craft.TestCommands
     // (mutates the AH with synthetic auctions, then cleans up).
@@ -552,6 +559,136 @@ std::string CMangosAHBot::CraftTestList(uint32_t itemId, uint32_t count, uint32_
         CharacterDatabase.CommitTransaction(trans);
     });
     return "created " + std::to_string(created) + " test auction(s), owner guid " + std::to_string(owner);
+}
+
+void CMangosAHBot::CraftTimingBench()
+{
+    const auto& cfg = gCMangosAHBotConfig;
+    if (!_craftBuilt) return;
+
+    std::vector<double> ms;
+    ms.reserve(200);
+    for (int i = 0; i < 200; ++i)
+    {
+        auto t0 = std::chrono::steady_clock::now();
+        std::unordered_map<uint32_t, uint64_t> medians; BuildAnchorMedians(medians);
+        ProjSource src(_costProducers);
+        LiveAnchor anchor(medians, [this](uint32_t id) -> uint64_t {
+            ItemTemplate const* p = sObjectMgr->GetItemTemplate(id); return p ? CalculateBuyoutPrice(p) : 0;
+        }, cfg.craftAnchorClampMin, cfg.craftAnchorClampMax);
+        CMangosAHBotCost cost(src, anchor); cost.NewPass();
+        std::vector<Crafter> pop = _population;
+        std::vector<CraftListing> out; std::unordered_map<uint32_t, uint32_t> cd;
+        uint32_t n = sCMangosAHBotRng->Urand(cfg.craftSessionsMin, cfg.craftSessionsMax);
+        RunSessions(pop, n, cost, out, true, cd);
+        ms.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    }
+    std::sort(ms.begin(), ms.end());
+    double mean = 0; for (double x : ms) mean += x; mean /= ms.size();
+    LOG_INFO("module", "CMangosAHBot[craft]: pass-time bench (compute: anchors+cost+{}-{} sessions, "
+             "200 iters) p50={:.2f}ms p99={:.2f}ms max={:.2f}ms mean={:.2f}ms [budget 200ms]",
+             cfg.craftSessionsMin, cfg.craftSessionsMax, ms[100], ms[198], ms.back(), mean);
+}
+
+std::string CMangosAHBot::CraftDump(const std::string& file, bool liveAH)
+{
+    const auto& cfg = gCMangosAHBotConfig;
+    if (!cfg.craftEnable || !_craftBuilt)
+        return "Craft layer disabled.";
+
+    std::ostringstream csv;
+    csv << "item,name,category,rarity,stack,unit_price,unit_matcost,ratio_pct,leveling\n";
+    uint32_t rows = 0;
+    // per-category ratio accumulation for the histogram (§9 C7 acceptance)
+    std::array<uint64_t, CAT_COUNT> catN{}, catRatioSum{};
+    std::array<uint32_t, CAT_COUNT> catRatioMin, catRatioMax; catRatioMin.fill(0xFFFFFFFF); catRatioMax.fill(0);
+
+    std::unordered_map<uint32_t, uint64_t> medians; BuildAnchorMedians(medians);
+    ProjSource src(_costProducers);
+    LiveAnchor anchor(medians, [this](uint32_t id) -> uint64_t {
+        ItemTemplate const* p = sObjectMgr->GetItemTemplate(id); return p ? CalculateBuyoutPrice(p) : 0;
+    }, cfg.craftAnchorClampMin, cfg.craftAnchorClampMax);
+    CMangosAHBotCost cost(src, anchor); cost.NewPass();
+    auto craftCostOf = [&](uint32_t item) -> uint64_t {
+        auto pit = _costProducers.find(item); if (pit == _costProducers.end()) return 0;
+        uint64_t best = 0; for (const CostRecipe* r : pit->second) { uint64_t c = cost.CraftCost(*r); if (c > 0 && (best == 0 || c < best)) best = c; }
+        return best;
+    };
+    auto emit = [&](uint32_t item, uint8_t category, uint8_t rarity, uint32_t stack,
+                    uint64_t unitPrice, uint64_t matcost, bool leveling)
+    {
+        ItemTemplate const* p = sObjectMgr->GetItemTemplate(item);
+        std::string name = p ? p->Name1 : "item#" + std::to_string(item);
+        for (char& c : name) if (c == ',') c = ' ';
+        uint32_t ratio = matcost ? uint32_t(unitPrice * 100 / matcost) : 0;
+        csv << item << ',' << name << ',' << CategoryName(ItemCategory(category)) << ','
+            << RarityName(RecipeRarity(rarity)) << ',' << stack << ',' << unitPrice << ','
+            << matcost << ',' << ratio << ',' << (leveling ? 1 : 0) << '\n';
+        ++rows;
+        if (matcost) { ++catN[category]; catRatioSum[category] += ratio;
+            catRatioMin[category] = std::min(catRatioMin[category], ratio);
+            catRatioMax[category] = std::max(catRatioMax[category], ratio); }
+    };
+
+    if (liveAH)
+    {
+        // Live craft-layer listings: bot-owned auctions whose item is a craft product.
+        for (uint32_t h = 0; h < CMAHB_HOUSE_COUNT; ++h)
+        {
+            AuctionHouseObject* ah = sAuctionMgr->GetAuctionsMap(CMAHB_AH_FIDS[h]);
+            if (!ah) continue;
+            for (auto it = ah->GetAuctionsBegin(); it != ah->GetAuctionsEnd(); ++it)
+            {
+                AuctionEntry* a = it->second;
+                if (!a || a->owner.GetCounter() != cfg.guid) continue;
+                uint64_t mc = craftCostOf(a->item_template);
+                if (mc == 0) continue; // not a craft product
+                const std::vector<uint32_t>* prod = _craftGraph.Producers(a->item_template);
+                uint8_t catv = CAT_MISC, rar = RARITY_UNSOURCED;
+                if (prod && !prod->empty()) { const CraftRecipe& r = _craftGraph.Recipes()[(*prod)[0]]; catv = r.category; rar = r.rarity; }
+                emit(a->item_template, catv, rar, a->itemCount, a->itemCount ? a->buyout / a->itemCount : a->buyout, mc, false);
+            }
+        }
+    }
+    else
+    {
+        // Simulated fill (non-mutating): production+leveling sessions, textured.
+        std::vector<Crafter> pop = _population;
+        std::vector<CraftListing> listings; std::unordered_map<uint32_t, uint32_t> cd;
+        RunSessions(pop, 4000, cost, listings, true, cd);
+        for (const CraftListing& L : listings)
+        {
+            ItemTemplate const* proto = sObjectMgr->GetItemTemplate(L.itemId);
+            if (!proto || !PassesFilters(proto)) continue;
+            uint64_t floor = std::max<uint64_t>(1, L.leveling ? L.unitMatCost * 60 / 100 : L.unitMatCost);
+            uint32_t maxStack = std::max(1u, uint32_t(proto->GetMaxStackSize()));
+            const std::vector<uint32_t>* prod = _craftGraph.Producers(L.itemId);
+            uint8_t rar = (prod && !prod->empty()) ? _craftGraph.Recipes()[(*prod)[0]].rarity : RARITY_UNSOURCED;
+            auto tl = CraftSim::TexturedListings(L.count, L.category, maxStack, L.unitPrice, floor,
+                                                 cfg.valueVariance, sCMangosAHBotRng->Engine());
+            for (auto& [stack, unit] : tl)
+                emit(L.itemId, L.category, rar, stack, unit, L.unitMatCost, L.leveling);
+        }
+    }
+
+    // Write file.
+    if (!file.empty())
+    {
+        FILE* f = fopen(file.c_str(), "w");
+        if (!f) return "craft dump: cannot open " + file;
+        std::string s = csv.str();
+        fwrite(s.data(), 1, s.size(), f);
+        fclose(f);
+    }
+
+    // Ratio histogram per category (acceptance #2) into the log/return string.
+    std::ostringstream sum;
+    sum << "craft dump: " << rows << " rows -> " << (file.empty() ? "(log only)" : file)
+        << " | ratio%[min/mean/max] by cat:";
+    for (uint8_t c = 0; c < CAT_COUNT; ++c)
+        if (catN[c]) sum << " " << CategoryName(ItemCategory(c)) << "="
+                         << catRatioMin[c] << "/" << (catRatioSum[c] / catN[c]) << "/" << catRatioMax[c];
+    return sum.str();
 }
 
 void CMangosAHBot::CraftTextureSample()

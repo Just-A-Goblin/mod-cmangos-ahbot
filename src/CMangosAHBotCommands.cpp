@@ -41,7 +41,7 @@ public:
         if (!sub)
         {
             handler->SendSysMessage("cmahbot: status | reload | rebuild [ally|horde|neutral] | "
-                                    "progression [refresh] | craft <status|selftest|simulate [n]|cost [n]|testlist ...> | "
+                                    "progression [refresh] | craft <status|selftest|simulate|cost|dump [file]|testlist ...> | "
                                     "item <id> <value> <chance> <min> <max> | item reset <id>");
             return true;
         }
@@ -94,6 +94,13 @@ public:
                 char* nArg = strtok(nullptr, " ");
                 uint32_t n = nArg ? static_cast<uint32_t>(strtoul(nArg, nullptr, 0)) : 0;
                 SendMultiline(handler, sCMangosAHBot->CraftSimulateCost(n));
+                return true;
+            }
+            if (p2 && strncmp(p2, "dump", strlen(p2)) == 0)
+            {
+                char* fArg = strtok(nullptr, " ");
+                std::string file = fArg ? fArg : "";
+                handler->SendSysMessage(sCMangosAHBot->CraftDump(file, /*liveAH=*/true).c_str());
                 return true;
             }
             if (p2 && strncmp(p2, "testlist", strlen(p2)) == 0)

@@ -106,6 +106,7 @@ public:
     std::string craftDemandStateBoost;
 
     uint32_t craftTestCommands = 0;      // gate for `craft testlist` (§8.3 / §10.4)
+    std::string craftDumpFile;           // if set, write a sim craft-dump CSV at startup (C7 sweep)
 
     // Helpers
     std::vector<uint32_t> ExcludedAccountList() const;

@@ -57,6 +57,10 @@ public:
     std::string CraftSelfTest() const;   // single "CRAFT SELFTEST: PASS|FAIL ..." line
     std::string CraftSimulateCost(uint32_t n) const;     // C2: cost queries only, no listing
     std::string CraftSimulateSessions(uint32_t n) const; // C3: run sessions, listing suppressed
+    // C7 §8.3: write a craft-dump CSV (item,name,category,rarity,stack,unit_price,
+    // unit_matcost,ratio,leveling). liveAH=true dumps bot-owned AH listings that are
+    // craft products; false dumps a non-mutating production+leveling sim.
+    std::string CraftDump(const std::string& file, bool liveAH);
 
 private:
     CMangosAHBot() = default;
@@ -105,6 +109,7 @@ private:
     void CraftSellPass(Player* bot, uint32_t houseIdx); // real sessions -> posted listings
     void CraftDemandSweep();  // C4: production category-mix across probe states (logged)
     void CraftTextureSample(); // C6: stack/price-point texture per category (logged)
+    void CraftTimingBench();   // C7: p50/p99 of the craft compute per pass (logged)
 
     // Simulation (Phase 4)
     void AddLootToItemMap(Player* bot, CmAHBItemMap& out);

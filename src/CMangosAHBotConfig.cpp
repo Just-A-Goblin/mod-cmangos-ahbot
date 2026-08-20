@@ -186,6 +186,7 @@ void CMangosAHBotConfig::Load()
     craftDemandStateBoost = sConfigMgr->GetOption<std::string>("CMangosAHBot.Craft.Demand.StateBoost", "");
 
     craftTestCommands = sConfigMgr->GetOption<uint32_t>("CMangosAHBot.Craft.TestCommands", 0);
+    craftDumpFile     = sConfigMgr->GetOption<std::string>("CMangosAHBot.Craft.DumpFile", "");
 
     LOG_INFO("module", "CMangosAHBot: config loaded (enable={} account={} guid={} progression={}/src{} tickComp={} craft={}/seed{})",
         enable, account, guid, progEnable, progSource, tickCompensation, craftEnable, craftSeed);

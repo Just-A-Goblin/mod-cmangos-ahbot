@@ -197,3 +197,8 @@ CMangosAHBot.Craft.Demand.StateBoost = ""
 # Gate for `.cmahbot craft testlist` (creates synthetic non-bot auctions for the
 # buyer test harness). Leave 0 in production.
 CMangosAHBot.Craft.TestCommands      = 0
+
+# If set, the module writes a simulated craft-dump CSV (item,category,rarity,stack,
+# unit_price,unit_matcost,ratio,leveling) to this path at startup — used by the
+# tools/craft-soak sweep driver. Leave empty in production.
+CMangosAHBot.Craft.DumpFile          = ""
