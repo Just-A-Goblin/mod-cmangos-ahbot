@@ -41,7 +41,7 @@ public:
         if (!sub)
         {
             handler->SendSysMessage("cmahbot: status | reload | rebuild [ally|horde|neutral] | "
-                                    "progression [refresh] | craft <status|selftest|simulate [n]|cost [n]> | "
+                                    "progression [refresh] | craft <status|selftest|simulate [n]|cost [n]|testlist ...> | "
                                     "item <id> <value> <chance> <min> <max> | item reset <id>");
             return true;
         }
@@ -94,6 +94,19 @@ public:
                 char* nArg = strtok(nullptr, " ");
                 uint32_t n = nArg ? static_cast<uint32_t>(strtoul(nArg, nullptr, 0)) : 0;
                 SendMultiline(handler, sCMangosAHBot->CraftSimulateCost(n));
+                return true;
+            }
+            if (p2 && strncmp(p2, "testlist", strlen(p2)) == 0)
+            {
+                char* a[4]; for (int i = 0; i < 4; ++i) a[i] = strtok(nullptr, " ");
+                if (!a[0] || !a[1] || !a[2] || !a[3])
+                {
+                    handler->SendSysMessage("Syntax: .cmahbot craft testlist <itemId> <count> <stack> <price>");
+                    return true;
+                }
+                handler->SendSysMessage(sCMangosAHBot->CraftTestList(
+                    strtoul(a[0], nullptr, 0), strtoul(a[1], nullptr, 0),
+                    strtoul(a[2], nullptr, 0), strtoul(a[3], nullptr, 0)).c_str());
                 return true;
             }
             // default: craft status

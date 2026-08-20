@@ -96,9 +96,12 @@ private:
     // Run n sessions over `pop`, appending would-be listings to `out`. Mutates `pop`
     // (skill-ups). Below-cap crafters level (§4.4); at-cap crafters produce (§5.2) when
     // `production` is true. countCd tracks per-recipe CD output within the run (§4.5).
+    // If ledgerCredit != nullptr, each session credits its reagents (the demand ledger,
+    // §6.1) — passed only on the LIVE path so the sim/sweep don't mutate live demand.
     void RunSessions(std::vector<Crafter>& pop, uint32_t n, CMangosAHBotCost& cost,
                      std::vector<CraftListing>& out, bool production,
-                     std::unordered_map<uint32_t, uint32_t>& cdCount);
+                     std::unordered_map<uint32_t, uint32_t>& cdCount,
+                     std::unordered_map<uint32_t, uint32_t>* ledgerCredit = nullptr);
     void CraftSellPass(Player* bot, uint32_t houseIdx); // real sessions -> posted listings
     void CraftDemandSweep();  // C4: production category-mix across probe states (logged)
 
@@ -190,6 +193,19 @@ private:
     std::unordered_map<uint32_t, double>   _professionShare;
     std::unordered_map<uint32_t, uint32_t> _cdCountLive; // spellId -> CD crafts in current window
     uint32_t _cdWindowStart = 0;                          // unix; reset every 24h
+
+    // Demand ledger + saturation (C5 §6). Both roll on a Craft.Ledger.WindowHours window.
+    std::unordered_map<uint32_t, uint32_t> _ledgerCredit; // itemId -> mat demand this window
+    std::unordered_map<uint32_t, uint32_t> _ledgerBought; // itemId -> units bought this window (§6.4)
+    uint32_t _ledgerWindowStart = 0;
+    std::vector<uint32_t> _testAuctionIds; // ids created by craft testlist (for cleanup)
+
+public:
+    // §8.3: create `count` synthetic non-bot auctions (owner = a resolved real char) of
+    // `stack` units at `price`/unit, for the buyer test harness (gated by
+    // Craft.TestCommands). Returns a status string.
+    std::string CraftTestList(uint32_t itemId, uint32_t count, uint32_t stack, uint32_t price);
+    void CraftBuyerSelfTest();  // Craft.TestCommands-gated in-server buyer check (logged)
 };
 
 #define sCMangosAHBot CMangosAHBot::instance()

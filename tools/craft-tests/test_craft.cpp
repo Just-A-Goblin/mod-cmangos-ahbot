@@ -302,6 +302,14 @@ int main()
     auto ovrZero = [](uint32_t){ return 0u; };
     check(CraftSim::ChooseProductionRecipe(prod,wFlaskOnly,66,26,boost,ovrZero,rng)==nullptr, "override weight 0 forbids");
 
+    // 19. Saturation curve endpoints (§6.4): 100% up to cap, floor at 3*cap, linear between.
+    checkEq(CraftSim::SaturationMultPct(0, 20, 30), 100, "saturation: below cap = 100%");
+    checkEq(CraftSim::SaturationMultPct(20, 20, 30), 100, "saturation: at cap = 100%");
+    checkEq(CraftSim::SaturationMultPct(60, 20, 30), 30, "saturation: at 3x cap = floor 30%");
+    checkEq(CraftSim::SaturationMultPct(80, 20, 30), 30, "saturation: past 3x cap = floor");
+    checkEq(CraftSim::SaturationMultPct(40, 20, 30), 65, "saturation: midpoint (2x cap) = 65%");
+    checkEq(CraftSim::SaturationMultPct(10, 0, 30), 100, "saturation: cap 0 => neutral 100%");
+
     std::printf("CRAFT-TESTS: %s  (%d passed, %d failed)\n",
                 g_fail==0 ? "PASS" : "FAIL", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

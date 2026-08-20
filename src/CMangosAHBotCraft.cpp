@@ -161,6 +161,16 @@ namespace CraftSim
         return scored.back().second;
     }
 
+    uint32_t SaturationMultPct(uint32_t bought, uint32_t cap, uint32_t floorMultPct)
+    {
+        if (cap == 0) return 100;
+        if (bought <= cap) return 100;
+        if (bought >= 3 * cap) return floorMultPct;
+        // Linear from 100% at `cap` to floorMultPct at 3*cap (span = 2*cap).
+        uint32_t drop = (100 - floorMultPct) * (bought - cap) / (2 * cap);
+        return 100 - drop;
+    }
+
     uint32_t CategoryBatch(uint8_t category, std::mt19937& rng)
     {
         auto u = [&](uint32_t a, uint32_t b) {

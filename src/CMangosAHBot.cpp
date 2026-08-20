@@ -271,6 +271,10 @@ void CMangosAHBot::CraftStartupDiagnostics()
 
     // C4 hand-check: demand-weighted production mix across eras.
     CraftDemandSweep();
+
+    // C5 hand-check: buyer (ledger buy + saturation). Gated by Craft.TestCommands
+    // (mutates the AH with synthetic auctions, then cleans up).
+    CraftBuyerSelfTest();
 }
 
 // ===========================================================================
@@ -481,6 +485,146 @@ std::string CMangosAHBot::CraftSimulateCost(uint32_t n) const
 }
 
 namespace { std::vector<std::pair<uint32_t, uint32_t>> ParseWeights(const std::string& raw); }
+
+std::string CMangosAHBot::CraftTestList(uint32_t itemId, uint32_t count, uint32_t stack, uint32_t price)
+{
+    const auto& cfg = gCMangosAHBotConfig;
+    if (!cfg.craftTestCommands)
+        return "craft testlist disabled (set Craft.TestCommands=1).";
+    ItemTemplate const* proto = sObjectMgr->GetItemTemplate(itemId);
+    if (!proto)
+        return "unknown item id";
+    if (count == 0) count = 1;
+    if (stack == 0) stack = 1;
+
+    // A real, non-bot character to own the auction (so the buyer treats it as a player).
+    uint32_t owner = 0;
+    if (QueryResult r = CharacterDatabase.Query(
+            "SELECT guid FROM characters WHERE account <> {} ORDER BY guid LIMIT 1", cfg.account))
+        owner = (*r)[0].Get<uint32_t>();
+    if (!owner)
+        return "no non-bot character available to own the test auction";
+    ObjectGuid ownerGuid = ObjectGuid::Create<HighGuid::Player>(owner);
+
+    uint32_t fid = CMAHB_AH_FIDS[CMAHB_HOUSE_NEUTRAL];
+    AuctionHouseEntry const* ahEntry = sAuctionMgr->GetAuctionHouseEntryFromFactionTemplate(fid);
+    AuctionHouseObject* ah = sAuctionMgr->GetAuctionsMap(fid);
+    if (!ahEntry || !ah)
+        return "neutral auction house unavailable";
+
+    uint32_t created = 0;
+    WithTransientBot([&](Player* b)
+    {
+        auto trans = CharacterDatabase.BeginTransaction();
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            Item* item = Item::CreateItem(itemId, 1, b);
+            if (!item) continue;
+            item->AddToUpdateQueueOf(b);
+            item->SetCount(stack);
+            uint32_t buyout = std::max(1u, price * stack);
+
+            AuctionEntry* ae      = new AuctionEntry();
+            ae->Id                = sObjectMgr->GenerateAuctionID();
+            ae->houseId           = AuctionHouseId(CMAHB_AH_IDS[CMAHB_HOUSE_NEUTRAL]);
+            ae->item_guid         = item->GetGUID();
+            ae->item_template     = item->GetEntry();
+            ae->itemCount         = item->GetCount();
+            ae->owner             = ownerGuid;                 // NON-bot owner
+            ae->startbid          = std::max(1u, buyout / 2);
+            ae->buyout            = buyout;
+            ae->bid               = 0;
+            ae->deposit           = 0;
+            ae->expire_time       = time(nullptr) + 24 * 3600;
+            ae->auctionHouseEntry = ahEntry;
+
+            item->SaveToDB(trans);
+            item->RemoveFromUpdateQueueOf(b);
+            sAuctionMgr->AddAItem(item);
+            ah->AddAuction(ae);
+            ae->SaveToDB(trans);
+            _testAuctionIds.push_back(ae->Id);
+            ++created;
+        }
+        CharacterDatabase.CommitTransaction(trans);
+    });
+    return "created " + std::to_string(created) + " test auction(s), owner guid " + std::to_string(owner);
+}
+
+void CMangosAHBot::CraftBuyerSelfTest()
+{
+    const auto& cfg = gCMangosAHBotConfig;
+    if (!cfg.craftTestCommands || !_craftBuilt)
+        return;
+
+    // Cost context (same basis the buyer uses).
+    std::unordered_map<uint32_t, uint64_t> medians; BuildAnchorMedians(medians);
+    ProjSource src(_costProducers);
+    LiveAnchor anchor(medians, [this](uint32_t id) -> uint64_t {
+        ItemTemplate const* p = sObjectMgr->GetItemTemplate(id); return p ? CalculateBuyoutPrice(p) : 0;
+    }, cfg.craftAnchorClampMin, cfg.craftAnchorClampMax);
+    CMangosAHBotCost cost(src, anchor); cost.NewPass();
+    auto craftCostOf = [&](uint32_t item) -> uint64_t {
+        auto pit = _costProducers.find(item);
+        if (pit == _costProducers.end()) return 0;
+        uint64_t best = 0;
+        for (const CostRecipe* r : pit->second) { uint64_t c = cost.CraftCost(*r); if (c > 0 && (best == 0 || c < best)) best = c; }
+        return best;
+    };
+
+    uint32_t now = static_cast<uint32_t>(time(nullptr));
+    if (_ledgerWindowStart == 0) _ledgerWindowStart = now;
+
+    auto idRange = [&]() -> std::string {
+        if (_testAuctionIds.empty()) return "none";
+        uint32_t lo = _testAuctionIds.front(), hi = _testAuctionIds.front();
+        for (uint32_t id : _testAuctionIds) { lo = std::min(lo, id); hi = std::max(hi, id); }
+        return std::to_string(lo) + ".." + std::to_string(hi);
+    };
+
+    // The buyer runs reliably only during Update() (OnStartup is pre-"World initialized").
+    // So CREATE the test auctions here and let the live buy passes consume them; verify by
+    // polling the auctionhouse table for these ids after a short soak.
+    // ---- Test A: a ledger-demanded mat, priced under the buyer's MatValue valuation ----
+    uint32_t testMat = 0; uint64_t matVal = 0;
+    for (auto& [sl, recs] : _craftCandidates)
+    { for (const CraftRecipe* r : recs) if (r->available) for (auto& [rid, rc] : r->reagents)
+        { uint64_t mv = cost.MatValue(rid); if (mv >= 20) { testMat = rid; matVal = mv; break; } }
+      if (testMat) break; }
+    if (testMat)
+    {
+        _ledgerCredit[testMat] += 100000; // durable demand so the window doesn't starve it
+        uint32_t price = uint32_t(std::max<uint64_t>(1, matVal * cfg.buyValue / 100 / 2));
+        _testAuctionIds.clear();
+        CraftTestList(testMat, 1, 20, price);
+        LOG_INFO("module", "CMangosAHBot[craft]: BUYER TEST-A (created) mat={} MatValue={} ask={}/u "
+                 "(buyer val={}/u > ask => expect BOUGHT) ledgerCredit={} auctionIds={}",
+                 testMat, matVal, price, matVal * cfg.buyValue / 100, _ledgerCredit[testMat], idRange());
+    }
+
+    // ---- Test B: saturation — 3*DailyCap identical craft products near cost ----
+    uint32_t satItem = 0; uint64_t baseVal = 0;
+    for (auto& [sl, recs] : _craftCandidates)
+    { for (const CraftRecipe* r : recs) if (r->available)
+        { uint64_t cc = craftCostOf(r->productItem); if (cc >= 20) { satItem = r->productItem; baseVal = cc; break; } }
+      if (satItem) break; }
+    if (satItem)
+    {
+        uint32_t cap = std::max(1u, cfg.craftBuyDailyCap);
+        uint32_t N = cap * 3;
+        uint32_t price = uint32_t(std::max<uint64_t>(1, baseVal * cfg.buyValue / 100 * 70 / 100));
+        uint32_t wouldBuy = 0; // deterministic §6.4 prediction
+        for (uint32_t i = 0; i < N; ++i)
+        { uint32_t sat = CraftSim::SaturationMultPct(wouldBuy, cap, cfg.craftBuyFloorMult);
+          if (price <= baseVal * sat / 100 * cfg.buyValue / 100) ++wouldBuy; else break; }
+        _testAuctionIds.clear();
+        CraftTestList(satItem, N, 1, price);
+        LOG_INFO("module", "CMangosAHBot[craft]: BUYER TEST-B (created) item={} craftCost={} ask={}/u listed={} "
+                 "predictBought={} (DailyCap={} floor={}%) auctionIds={}",
+                 satItem, baseVal, price, N, wouldBuy, cap, cfg.craftBuyFloorMult, idRange());
+    }
+    // No cleanup: the live buy passes consume these; leftovers are removed by SQL after the check.
+}
 
 void CMangosAHBot::CraftDemandSweep()
 {
@@ -709,7 +853,8 @@ void CMangosAHBot::UpdatePopulationCaps()
 
 void CMangosAHBot::RunSessions(std::vector<Crafter>& pop, uint32_t n, CMangosAHBotCost& cost,
                               std::vector<CraftListing>& out, bool production,
-                              std::unordered_map<uint32_t, uint32_t>& cdCount)
+                              std::unordered_map<uint32_t, uint32_t>& cdCount,
+                              std::unordered_map<uint32_t, uint32_t>* ledgerCredit)
 {
     const auto& cfg = gCMangosAHBotConfig;
     if (pop.empty())
@@ -781,6 +926,11 @@ void CMangosAHBot::RunSessions(std::vector<Crafter>& pop, uint32_t n, CMangosAHB
             }
         }
 
+        // Demand ledger (§6.1): the crafter consumes these mats -> the bot demands them.
+        if (ledgerCredit)
+            for (auto& [rid, rc] : r->reagents)
+                (*ledgerCredit)[rid] += rc * batch;
+
         uint64_t matcost = CraftSim::MatCost(*r, cost);
         CraftListing L;
         L.itemId      = r->productItem;
@@ -790,7 +940,6 @@ void CMangosAHBot::RunSessions(std::vector<Crafter>& pop, uint32_t n, CMangosAHB
         L.skillLine   = r->skillLine;
         L.category    = static_cast<uint8_t>(r->category);
         out.push_back(L);
-        // ledger.Credit(reagents x batch) is the buyer's demand ledger — C5.
     }
 }
 
@@ -817,13 +966,16 @@ void CMangosAHBot::CraftSellPass(Player* bot, uint32_t houseIdx)
     CMangosAHBotCost cost(src, anchor);
     cost.NewPass();
 
-    // Rolling 24h window for daily-cooldown output (§4.5).
+    // Rolling windows: daily-cooldown output (§4.5) and demand ledger (§6.1).
     uint32_t now = static_cast<uint32_t>(time(nullptr));
     if (_cdWindowStart == 0 || now - _cdWindowStart >= 86400) { _cdCountLive.clear(); _cdWindowStart = now; }
+    uint32_t ledgerWin = std::max(1u, cfg.craftLedgerWindowHours) * 3600u;
+    if (_ledgerWindowStart == 0 || now - _ledgerWindowStart >= ledgerWin)
+    { _ledgerCredit.clear(); _ledgerBought.clear(); _ledgerWindowStart = now; }
 
     std::vector<CraftListing> listings;
     uint32_t nSessions = sCMangosAHBotRng->Urand(cfg.craftSessionsMin, cfg.craftSessionsMax);
-    RunSessions(_population, nSessions, cost, listings, /*production=*/true, _cdCountLive);
+    RunSessions(_population, nSessions, cost, listings, /*production=*/true, _cdCountLive, &_ledgerCredit);
     if (listings.empty())
         return;
 
@@ -1654,6 +1806,31 @@ void CMangosAHBot::BuyPass(Player* bot, uint32_t houseIdx)
     // §6.2: buyout mutates the auction map — collect targets, execute AFTER iterating.
     std::vector<uint32_t> buyoutIds;
 
+    // Craft-aware valuation context (C5 §6). Built only when the craft layer is on, so
+    // with Craft.Enable=0 the buyer path is byte-identical to the base module (#1).
+    const bool craftVal = cfg.craftEnable && _craftBuilt;
+    std::unordered_map<uint32_t, uint64_t> medians;
+    if (craftVal) BuildAnchorMedians(medians);
+    ProjSource csrc(_costProducers);
+    LiveAnchor canchor(medians, [this](uint32_t id) -> uint64_t {
+        ItemTemplate const* p = sObjectMgr->GetItemTemplate(id);
+        return p ? CalculateBuyoutPrice(p) : 0;
+    }, cfg.craftAnchorClampMin, cfg.craftAnchorClampMax);
+    CMangosAHBotCost ccost(csrc, canchor);
+    if (craftVal) ccost.NewPass();
+    // Units queued for buyout THIS pass, so saturation engages within the pass (the
+    // real buyouts are deferred, so _ledgerBought only updates after the loop).
+    std::unordered_map<uint32_t, uint32_t> localBought;
+    // Cheapest available make-cost of an item (0 if not a craft product) — §6.3.
+    auto craftCostOf = [&](uint32_t item) -> uint64_t {
+        auto pit = _costProducers.find(item);
+        if (pit == _costProducers.end()) return 0;
+        uint64_t best = 0;
+        for (const CostRecipe* r : pit->second)
+        { uint64_t c = ccost.CraftCost(*r); if (c > 0 && (best == 0 || c < best)) best = c; }
+        return best;
+    };
+
     for (auto it = auctionHouse->GetAuctionsBegin(); it != auctionHouse->GetAuctionsEnd(); ++it)
     {
         AuctionEntry* auction = it->second;
@@ -1664,7 +1841,32 @@ void CMangosAHBot::BuyPass(Player* bot, uint32_t houseIdx)
         if (!proto)
             continue;
 
-        uint64_t perUnit = CalculateBuyoutPrice(proto);
+        // Per-unit valuation. Base = vendor-anchored intrinsic (unchanged). Craft layer
+        // overrides via the SAME cost engine (buyer coherence, #2): crafted goods at
+        // their make-cost (§6.3), ledger-demanded mats at MatValue (§6.2), then scaled
+        // by the saturation curve (§6.4).
+        uint64_t perUnit;
+        if (craftVal)
+        {
+            uint32_t item = auction->item_template;
+            uint64_t base = craftCostOf(item);                       // §6.3 crafted symmetry
+            if (base == 0)
+            {
+                auto lc = _ledgerCredit.find(item);
+                if (lc != _ledgerCredit.end() && lc->second > 0)
+                    base = ccost.MatValue(item);                     // §6.2 ledger-demanded mat
+                else
+                    base = CalculateBuyoutPrice(proto);              // fallback: base intrinsic
+            }
+            auto bought = _ledgerBought.find(item);
+            uint32_t boughtN = (bought == _ledgerBought.end() ? 0 : bought->second)
+                             + (localBought.count(item) ? localBought[item] : 0);
+            uint32_t sat = CraftSim::SaturationMultPct(boughtN, cfg.craftBuyDailyCap, cfg.craftBuyFloorMult);
+            perUnit = base * sat / 100;
+        }
+        else
+            perUnit = CalculateBuyoutPrice(proto);
+
         if (perUnit == 0)
             continue;
 
@@ -1673,9 +1875,11 @@ void CMangosAHBot::BuyPass(Player* bot, uint32_t houseIdx)
         if (valuation == 0)
             continue;
 
+
         // Buy out when the ask sits below our valuation.
         if (auction->buyout > 0 && auction->buyout <= valuation)
         {
+            if (craftVal) localBought[auction->item_template] += auction->itemCount; // saturate in-pass
             buyoutIds.push_back(auction->Id);
             continue;
         }
@@ -1700,11 +1904,14 @@ void CMangosAHBot::BuyPass(Player* bot, uint32_t houseIdx)
     }
 
     // Deferred buyouts.
+    uint32_t executed = 0;
     for (uint32_t id : buyoutIds)
     {
         AuctionEntry* auction = auctionHouse->GetAuction(id);
         if (!auction)
             continue;
+        ++executed;
+        uint32_t boughtItem = auction->item_template, boughtCount = auction->itemCount;
         auto trans = CharacterDatabase.BeginTransaction();
         if (auction->bidder && auction->bidder != bot->GetGUID())
             sAuctionMgr->SendAuctionOutbiddedMail(auction, auction->buyout, bot, trans);
@@ -1717,7 +1924,19 @@ void CMangosAHBot::BuyPass(Player* bot, uint32_t houseIdx)
         CharacterDatabase.CommitTransaction(trans);
         sAuctionMgr->RemoveAItem(auction->item_guid);
         auctionHouse->RemoveAuction(auction);
+
+        // Ledger: record the purchase for saturation (§6.4) and debit demand (§6.2).
+        if (craftVal)
+        {
+            _ledgerBought[boughtItem] += boughtCount;
+            auto lc = _ledgerCredit.find(boughtItem);
+            if (lc != _ledgerCredit.end())
+                lc->second -= std::min(lc->second, boughtCount);
+        }
     }
+    if (craftVal && !buyoutIds.empty())
+        LOG_DEBUG("module", "CMangosAHBot[craft]: BuyPass house={} queuedBuyouts={} executed={}",
+                  CMAHB_AH_IDS[houseIdx], buyoutIds.size(), executed);
 }
 
 // ===========================================================================

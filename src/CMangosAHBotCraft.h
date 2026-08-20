@@ -97,4 +97,9 @@ namespace CraftSim
 
     // Realistic production batch (# of crafts) by category (§7.2, basic form).
     uint32_t CategoryBatch(uint8_t category, std::mt19937& rng);
+
+    // Demand-saturation multiplier as a percentage (§6.4, exploit control): 100 up to
+    // `cap` units bought in the window, then linear decay to `floorMultPct` at 3*cap
+    // (dump 100 flasks -> price crashes). Caps the gold faucet with one mechanism.
+    uint32_t SaturationMultPct(uint32_t bought, uint32_t cap, uint32_t floorMultPct);
 }
