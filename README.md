@@ -78,6 +78,59 @@ changes that encoding, that query is the one thing to update.
 | 60s core hook vs CMaNGOS 20s tick | Compensated by `TickCompensation` (verify ~120s per-house period empirically). |
 | No market-price learning | Near-inert on a solo server; expiry is the dominant price signal. |
 
+## Craft economy (addendum 2)
+
+A second, parallel generator that **simulates crafters** (not crafted items), enabled with
+`CMangosAHBot.Craft.Enable = 1`. With it off the module is behaviorally identical to the
+base loot-simulation seller/buyer.
+
+- **Recipe graph** built from the server's `SPELL_EFFECT_CREATE_ITEM` profession spells,
+  classified by acquisition rarity and demand category, and gated by the same progression
+  machinery (skill line/rank era, product ilvl, and a **reagent-era** rule so cross-era
+  goods — a Netherweave bag, a Frost Wyrm flask — never appear before their unlock).
+- **Cost engine**: recursive, memoized, cycle-safe `MatValue` = min(market anchor, cheapest
+  make). One valuation path feeds both seller and buyer (buyer coherence).
+- **Sessions**: a virtual crafter population runs each sell pass. Below-cap crafters *level*
+  (dump the cheapest-skill-up-per-gold goods below cost — the emergent bar/bolt/bandage
+  glut); at-cap crafters *produce* demand-weighted goods (per-era category weights, a GEAR
+  ilvl window, daily-cooldown scarcity). Nothing is hardcoded — the gluts and era meta are
+  emergent.
+- **Buyer + demand ledger**: sessions credit the mats they consume; the buyer buys those
+  mats from players (the gold **faucet**) and values crafted goods at make-cost, throttled
+  by a **saturation curve** (`Craft.Buy.DailyCap` → `FloorMult`) so dumping crashes the price.
+- **Market texture**: listings are split into category-appropriate stacks across a 2–4 rung
+  undercut ladder, never below a floor (100 % of mat cost producing / 60 % leveling).
+
+**Gold flow:** bot mat purchases inject gold into player pockets; crafted listings sink it.
+On a solo/household server the faucet is the point — `Craft.Buy.DailyCap` is the throttle.
+
+**Legacy fallback:** the flat `Items.Profession` loot source is **retired** while
+`Craft.Enable = 1` (it produces uniform noise — no glut, no meta). Set `Craft.Enable = 0`
+to fall back to it. Do not run both as listing producers.
+
+**Config:** all keys under `CMangosAHBot.Craft.*` (see `conf/cmangos_ahbot.conf.dist`).
+Notable: `Craft.Seed` (nonzero = reproducible, via a module-local RNG); `Craft.Population`,
+`Craft.ProfessionWeights`, `Craft.SkillDist`; per-era `Craft.Demand.*`; margins; the buyer
+`Craft.Buy.*` + `Craft.Ledger.WindowHours`; `Craft.TestCommands` (buyer test harness) and
+`Craft.DumpFile` (sweep CSV). SQL adds `craft_weight`/`craft_margin` to the override table
+(`data/sql/db-characters/cmangos_ahbot_items_craft.sql`, additive/idempotent).
+
+**Commands:** `.cmahbot craft status | selftest | simulate [n] | cost [n] | dump [file] |
+testlist <id> <count> <stack> <price>`.
+
+**Known deltas / limits** (see `NOTES-verification.md`): the `SCROLL` category is inert
+(enchant scrolls are `ENCHANT_ITEM`-on-vellum, not create-item spells); daily-cooldown
+detection catches only recipes whose CD is on the create-item spell (WotLK profession
+dailies enforce theirs via triggered-spell/category indirection); ammo over-dominates unit
+counts (its *listing* share is weight-correct). All are config-tunable and correctness-neutral.
+
+### Tooling
+
+- `tools/craft-tests/` — offline unit tests for the cost engine, glut chooser, skill-up,
+  saturation, and texture (no server). `55/55`.
+- `tools/craft-soak/run_sweep.py` — black-box progression sweep (config + restart + startup
+  dump CSV + pandas assertions on distribution properties and cross-era sentinels).
+
 ## Coexistence with `mod-ah-bot`
 
 `mod-ah-bot` may remain installed as a fallback, but its **seller and buyer must

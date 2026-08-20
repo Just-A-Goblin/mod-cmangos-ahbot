@@ -458,3 +458,39 @@ AMMO         Crafted Light Shot   matcost 1: full stack (§7.2)
 Design note: the 2-4 price points ARE the ladder (§7.2 "via variance + one undercut step") — variance
 jitters the top rung once and each lower rung is one undercut step below, floored; stacks spread across
 rungs with no extra per-stack jitter (else a wall of near-dupes instead of a clean ladder).
+
+---
+
+# Phase C7 — measurement, tuning, and the progression sweep
+
+**1. p99 pass time (< 200 ms budget):**
+```
+pass-time bench (anchors + cost + 4-8 sessions, 200 iters): p50=0.48ms p99=1.01ms max=1.73ms mean=0.52ms
+```
+**p99 = 1.01 ms — ~200× under budget.** ✅ (DB posting is one batched transaction per pass, not in this
+compute figure; the world-thread stall is the compute, which is ~0.5 ms.)
+
+**2. price-to-cost ratio histogram per category (from `craft dump`, state 13):**
+```
+ratio% [min/mean/max]: FLASK 62/157/328  ELIXIR_POT 63/197/328  FOOD 61/118/294  BAG 63/116/314
+                       GEM_CUT 61/116/318  AMMO 58/76/101  GEAR 50/76/288  INTERMEDIATE 33/105/300  MISC 60/84/327
+```
+Means sit in sensible bands: leveling-heavy categories (AMMO/GEAR ~76%) below cost; production categories
+(FLASK 157%, ELIXIR_POT 197%) in the DROP-margin range. Mins ≈ 60% (leveling floor); the 33% outlier is
+tiny-matcost integer rounding floored at 1 copper, not a floor violation. ✅
+
+**3. §10.4/§10.5 sweep driver (`tools/craft-soak/run_sweep.py`, states 0/8/13):** `SWEEP: PASS`. Per state
+(12k–16k dump rows): all raw + crafted cross-era sentinels gated; **GEM_CUT present iff state ≥ TBC**;
+SCROLL inert; state-0 leveling glut share 0.34; median ratio 83–89 % in band; ≥98 % of listings ≥ floor.
+Baselines archived under `tools/craft-soak/baselines/`. The driver needs no SOAP — it drives via
+config-edit + restart + the module's startup `Craft.DumpFile` CSV.
+
+**4. Equilibrium stock (inflow × mean lifetime):** analytical prediction only — with defaults
+(Sessions 4–8/pass, ~2–4 stacks each ⇒ ~15 listings per neutral sell pass at ~120 s cadence, mean
+lifetime (2+24)/2 = 13 h) the per-house craft equilibrium ≈ (15/120 s) × 46 800 s ≈ **5.9 k listings**.
+Empirical confirmation needs a multi-hour soak; **deferred**, consistent with the base plan's Phase-8
+treatment of equilibrium (there is no stock cap — expiry is the sink).
+
+**Tuning notes (carried, not blockers):** ammo over-dominates *unit* counts (high `productCount`) though
+its *listing* share is weight-correct; CD detection stays ≈1 recipe (real `Spell.dbc` dailies aren't on
+the create-item spell — documented in C4); both are config-tunable and do not affect correctness.
