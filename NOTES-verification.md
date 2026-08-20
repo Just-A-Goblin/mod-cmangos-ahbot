@@ -309,3 +309,45 @@ Secondary note: smelting spells (Smelt Copper etc.) classify **UNSOURCED** (thei
 not in `trainer_spell`), so bars carry DROP production margins — but bars are overwhelmingly
 leveling-dumped (LevelingMargin), so the production margin rarely applies. Revisit in C3/C4 if bar
 pricing looks off.
+
+---
+
+# Phase C3 — leveling simulator (sell-only) + reagent-era gate (pulled from C4)
+
+**Pure sim layer (`CMangosAHBotCraft.{h,cpp}`) offline-tested:** `CRAFT-TESTS: PASS (37/37)` — added
+skill-up bands (C-A2), glut-chooser picks the cheapest-per-skill-up recipe (grey/too-high never
+chosen), skill-up advancement bounded by cap, population roll (skills in `[1,cap]`, professions from
+weights). All craft RNG flows through the seeded module engine.
+
+**Live 500-session leveling snapshot (state 0, seed 12345):** emergent glut with **nothing named in
+config** — Engineering ammo, alchemy/enchant oils, low BS/LW/Tailoring greens, First-Aid anti-venoms,
+enchant shards — **100% below craft cost** (priced items), **Layer 3 would-drop = 0**, no crash. Per
+the glut-presence probe, all seven named vanilla gluts (**Copper/Bronze/Tin Bar, Bolt of Linen/Woolen
+Cloth, Linen/Heavy Wool Bandage**) are available at state 0 (dispersed below ammo's high-`productCount`
+raw counts in the top-20 view). Legacy `Items.Profession` is retired when `Craft.Enable=1`;
+`Craft.Enable=0` leaves the base seller/buyer byte-identical.
+
+## Reagent-era gate (§2.3 rule 3) — pulled forward from C4 and fully closed
+
+C3 output initially leaked **Netherweave Net (TBC) at state 0** (the C2-flagged class: ilvl/skill-mask
+-exempt items using cross-era mats). Root cause found: **TBC/WotLK *instance* maps carry unreliable
+`MapEntry::expansionID` (often 0)** in the 3.3.5 client DBC, so a `MIN`-over-sources classification let
+one mis-flagged instance drag cloth to Vanilla. Ore was immune (open-world only), which is why it
+already gated right.
+
+Fix (in `BuildItemExpansion` + graph `Build`):
+1. **Plurality by spawn count**, not MIN — Netherweave's 6305 open-world Outland spawns outvote the
+   handful in mis-flagged instances. Vote accumulation is **separate** from the base source-vector
+   `MinMerge`, so world-drop gating is unchanged (constraint #1).
+2. **Fixpoint propagation through crafted reagents** — a mat's obtain-era = `min(looted era, cheapest
+   craftable era)`; iterate so bags/flasks consuming *crafted* cross-era mats gate too.
+
+Verified at state 0: all four raw sentinels classify correctly (Netherweave/Fel Iron = TBC,
+Frostweave/Saronite = WotLK) with **0 available consumers**; crafted cross-era sentinels
+**Netherweave Bag, Glacial Bag, Flask of the Frost Wyrm all absent (correct)**. This also resolves the
+**C2 Glacial Bag leak** and pre-satisfies the **C4 §12 crafted-sentinel** requirement. Gate sweep stays
+monotonic (state 0/8/13/18 → 1088/1892/2798/2885 available).
+
+Remaining for later: ammo over-dominates raw counts (high `productCount`); smelted-bar volume is
+understated in the *startup* snapshot because some mats have no live median at `OnStartup` (0 matcost
+inflates 0-cost recipes) — a measurement/tuning item for **C7**, not a mechanism bug.
