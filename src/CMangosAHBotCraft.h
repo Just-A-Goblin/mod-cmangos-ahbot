@@ -13,6 +13,7 @@
 #include "CMangosAHBotRecipes.h"
 #include "CMangosAHBotCost.h"
 #include <cstdint>
+#include <functional>
 #include <random>
 #include <vector>
 
@@ -80,4 +81,20 @@ namespace CraftSim
                                         const std::vector<std::pair<uint32_t, uint32_t>>& weights,
                                         uint16_t cap, double alpha, double beta,
                                         std::mt19937& rng);
+
+    // Production recipe choice (§5.2): weight = CategoryWeight(era) * ilvlWindow(GEAR)
+    // * stateBoost * overrideWeight, sampled proportionally among the crafter's
+    // profession's available recipes. catWeight is indexed by ItemCategory (size
+    // CAT_COUNT). stateBoostPct/overrideWeightPct return percentages (100 = neutral;
+    // overrideWeightPct==0 => never craft). GEAR outside [ilvlCap-gearWindow, ilvlCap]
+    // gets weight 0. Returns nullptr if nothing is craftable.
+    const CraftRecipe* ChooseProductionRecipe(const std::vector<const CraftRecipe*>& profRecipes,
+                                              const uint32_t* catWeight, uint32_t ilvlCap,
+                                              uint32_t gearWindow,
+                                              const std::function<uint32_t(uint8_t)>& stateBoostPct,
+                                              const std::function<uint32_t(uint32_t)>& overrideWeightPct,
+                                              std::mt19937& rng);
+
+    // Realistic production batch (# of crafts) by category (§7.2, basic form).
+    uint32_t CategoryBatch(uint8_t category, std::mt19937& rng);
 }

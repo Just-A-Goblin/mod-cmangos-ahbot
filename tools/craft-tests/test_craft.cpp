@@ -280,6 +280,28 @@ int main()
     check(profOk, "all professions from the weight table");
     check(below > 0, "a fresh (state-0) population has below-cap levelers");
 
+    // 18. Production chooser (§5.2): category weights steer selection; GEAR ilvl
+    //     window gates; override weight 0 forbids.
+    CraftRecipe pFlask = mkRecipe(6001, {{PEACEBLOOM,2}}, 300, 300, 300);
+    pFlask.category = CAT_FLASK;      pFlask.productIlvl = 75;
+    CraftRecipe pGearIn = mkRecipe(6002, {{COPPER_ORE,3}}, 300, 300, 300);
+    pGearIn.category = CAT_GEAR;      pGearIn.productIlvl = 66;   // inside [40,66]
+    CraftRecipe pGearOut = mkRecipe(6003, {{COPPER_ORE,3}}, 300, 300, 300);
+    pGearOut.category = CAT_GEAR;     pGearOut.productIlvl = 200; // outside window
+    std::vector<const CraftRecipe*> prod = {&pFlask,&pGearIn,&pGearOut};
+    uint32_t wFlaskOnly[CAT_COUNT] = {0}; wFlaskOnly[CAT_FLASK] = 100;
+    uint32_t wGearOnly[CAT_COUNT]  = {0}; wGearOnly[CAT_GEAR] = 100;
+    auto boost = [](uint8_t){ return 100u; };
+    auto ovr   = [](uint32_t){ return 100u; };
+
+    int fFlask=0; for (int i=0;i<500;++i) if (CraftSim::ChooseProductionRecipe(prod,wFlaskOnly,66,26,boost,ovr,rng)==&pFlask) ++fFlask;
+    checkEq((uint64_t)fFlask, 500, "FLASK-only weights -> always flask");
+    int inWin=0,outWin=0; for (int i=0;i<500;++i){ auto* p=CraftSim::ChooseProductionRecipe(prod,wGearOnly,66,26,boost,ovr,rng); if(p==&pGearIn)++inWin; else if(p==&pGearOut)++outWin; }
+    check(inWin > 0, "GEAR in ilvl window is chosen");
+    checkEq((uint64_t)outWin, 0, "GEAR outside ilvl window never chosen");
+    auto ovrZero = [](uint32_t){ return 0u; };
+    check(CraftSim::ChooseProductionRecipe(prod,wFlaskOnly,66,26,boost,ovrZero,rng)==nullptr, "override weight 0 forbids");
+
     std::printf("CRAFT-TESTS: %s  (%d passed, %d failed)\n",
                 g_fail==0 ? "PASS" : "FAIL", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

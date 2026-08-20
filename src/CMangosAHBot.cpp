@@ -129,9 +129,12 @@ void CMangosAHBot::Initialize()
 
     RefreshProgression(true); // sets caps, builds filtered vectors, logs sizes, masks craft graph
 
-    // Roll the crafter population once caps/candidates exist (C3, §4.1).
+    // Roll the crafter population once caps/candidates exist (C3, §4.1), parse demand (C4 §5).
     if (_craftBuilt)
+    {
+        ParseDemand();
         BuildPopulation();
+    }
 
     // Guardrail (plan §6): a critical empty vector means a source contributes nothing.
     bool anyEmpty = _creature[0].empty() || _fishing.empty() || _gameobject.empty() ||
@@ -265,6 +268,9 @@ void CMangosAHBot::CraftStartupDiagnostics()
         while (std::getline(ss, line))
             LOG_INFO("module", "{}", line);
     }
+
+    // C4 hand-check: demand-weighted production mix across eras.
+    CraftDemandSweep();
 }
 
 // ===========================================================================
@@ -474,6 +480,82 @@ std::string CMangosAHBot::CraftSimulateCost(uint32_t n) const
     return CraftCostChains(n);
 }
 
+namespace { std::vector<std::pair<uint32_t, uint32_t>> ParseWeights(const std::string& raw); }
+
+void CMangosAHBot::CraftDemandSweep()
+{
+    const auto& cfg = gCMangosAHBotConfig;
+    if (!_craftBuilt)
+        return;
+
+    CmAHBCaps saved = _caps;
+    std::unordered_map<uint32_t, uint64_t> medians;
+    BuildAnchorMedians(medians);
+
+    const uint8_t probes[] = { 0, 7, 8, 13, 18 };
+    const char* eraName[] = { "Vanilla", "TBC", "WotLK" };
+    LOG_INFO("module", "CMangosAHBot[craft]: demand sweep (production mix, all-at-cap pop, per era weights):");
+
+    for (uint8_t st : probes)
+    {
+        _caps = CMangosAHBotProgression::CapsForState(st);
+        _craftGraph.RecomputeMask(_caps, cfg.progTbcAtState, cfg.progWotlkAtState, cfg.progSkillCaps);
+        BuildCostProjection();
+        BuildCraftCandidates();
+
+        ProjSource src(_costProducers);
+        LiveAnchor anchor(medians, [this](uint32_t id) -> uint64_t {
+            ItemTemplate const* p = sObjectMgr->GetItemTemplate(id);
+            return p ? CalculateBuyoutPrice(p) : 0;
+        }, cfg.craftAnchorClampMin, cfg.craftAnchorClampMax);
+        CMangosAHBotCost cost(src, anchor);
+        cost.NewPass();
+
+        uint16_t cap = CraftSim::CapForState(st, cfg.progTbcAtState, cfg.progWotlkAtState);
+        auto weights = ParseWeights(cfg.craftProfessionWeights);
+        auto pop = CraftSim::RollPopulation(cfg.craftPopulation, weights, cap, 5.0, 1.2,
+                                            sCMangosAHBotRng->Engine());
+        for (auto& c : pop) c.skill = c.cap; // force producers to isolate the demand mix
+
+        std::vector<CraftListing> listings;
+        std::unordered_map<uint32_t, uint32_t> cd;
+        RunSessions(pop, 1500, cost, listings, /*production=*/true, cd);
+
+        // Report the selection MIX by listings (not units): units are dominated by
+        // high-productCount categories (ammo) and hide the demand weights.
+        uint64_t catListings[CAT_COUNT] = {0}, units = 0, cdCrafts = 0;
+        uint32_t gearMin = 0xFFFFFFFF, gearMax = 0;
+        for (const CraftListing& L : listings)
+        {
+            ++catListings[L.category]; units += L.count;
+            if (L.category == CAT_GEAR)
+                if (ItemTemplate const* p = sObjectMgr->GetItemTemplate(L.itemId))
+                { gearMin = std::min(gearMin, p->ItemLevel); gearMax = std::max(gearMax, p->ItemLevel); }
+        }
+        for (auto& [sp, c] : cd) cdCrafts += c;
+        uint64_t nList = listings.size();
+
+        std::ostringstream ss;
+        ss << "  state=" << int(st) << " era=" << eraName[std::min<uint8_t>(_caps.maxExpansion,2)]
+           << " listings=" << nList << " units=" << units << " |";
+        for (uint8_t c = 0; c < CAT_COUNT; ++c)
+            if (catListings[c]) ss << " " << CategoryName(ItemCategory(c)) << "="
+                                << (nList ? catListings[c] * 100 / nList : 0) << "%";
+        uint32_t lo = cap /*proxy*/, ilvlCap = _caps.itemLevelCap == NOCAP ? 0 : _caps.itemLevelCap;
+        (void)lo;
+        ss << " | GEAR ilvl [" << (gearMax ? gearMin : 0) << ".." << gearMax << "] window["
+           << (ilvlCap > cfg.craftGearWindow ? ilvlCap - cfg.craftGearWindow : 0) << ".." << ilvlCap << "]"
+           << " | CD crafts=" << cdCrafts << " across " << cd.size() << " recipes";
+        LOG_INFO("module", "{}", ss.str());
+    }
+
+    // Restore live state.
+    _caps = saved;
+    _craftGraph.RecomputeMask(_caps, cfg.progTbcAtState, cfg.progWotlkAtState, cfg.progSkillCaps);
+    BuildCostProjection();
+    BuildCraftCandidates();
+}
+
 // ===========================================================================
 // Craft session layer (crafting addendum §4) — C3 (leveling only)
 // ===========================================================================
@@ -521,6 +603,58 @@ namespace
         }
         return DefaultBeta(state, tbcAt, wotlkAt);
     }
+
+    int CategoryFromName(const std::string& n)
+    {
+        for (uint8_t c = 0; c < CAT_COUNT; ++c)
+            if (n == CategoryName(ItemCategory(c)))
+                return c;
+        return -1;
+    }
+}
+
+void CMangosAHBot::ParseDemand()
+{
+    const auto& cfg = gCMangosAHBotConfig;
+    for (auto& row : _demandWeights) for (auto& w : row) w = 0;
+    _stateBoost.clear();
+
+    auto parseEra = [&](uint8_t era, const std::string& raw)
+    {
+        std::istringstream ss(raw);
+        std::string tok;
+        while (std::getline(ss, tok, ','))
+        {
+            auto colon = tok.find(':');
+            if (colon == std::string::npos) continue;
+            int cat = CategoryFromName(tok.substr(0, colon));
+            if (cat < 0) continue;
+            try { _demandWeights[era][cat] = std::stoul(tok.substr(colon + 1)); } catch (...) {}
+        }
+    };
+    parseEra(0, cfg.craftDemandVanilla);
+    parseEra(1, cfg.craftDemandTbc);
+    parseEra(2, cfg.craftDemandWotlk);
+
+    // StateBoost "state:CATEGORY:mult,..."
+    { std::istringstream ss(cfg.craftDemandStateBoost); std::string tok;
+      while (std::getline(ss, tok, ','))
+      {
+          auto c1 = tok.find(':'); auto c2 = tok.rfind(':');
+          if (c1 == std::string::npos || c1 == c2) continue;
+          int cat = CategoryFromName(tok.substr(c1 + 1, c2 - c1 - 1));
+          if (cat < 0) continue;
+          try {
+              uint32_t st = std::stoul(tok.substr(0, c1));
+              uint32_t mult = std::stoul(tok.substr(c2 + 1));
+              _stateBoost[st * CAT_COUNT + uint32_t(cat)] = mult;
+          } catch (...) {}
+      }
+    }
+    LOG_INFO("module", "CMangosAHBot[craft]: demand weights parsed (vanilla FLASK={} GEAR={} INTERMEDIATE={}; "
+             "stateBoosts={}). Note: SCROLL has no create-item supply (enchant-on-vellum) — weight inert.",
+             _demandWeights[0][CAT_FLASK], _demandWeights[0][CAT_GEAR], _demandWeights[0][CAT_INTERMEDIATE],
+             _stateBoost.size());
 }
 
 void CMangosAHBot::BuildCraftCandidates()
@@ -548,6 +682,15 @@ void CMangosAHBot::BuildPopulation()
     _population = CraftSim::RollPopulation(cfg.craftPopulation, weights, cap, alpha, beta,
                                            sCMangosAHBotRng->Engine());
 
+    // Profession share of the rolled population (for §4.5 CD daily caps).
+    _professionShare.clear();
+    if (!_population.empty())
+    {
+        std::unordered_map<uint32_t, uint32_t> cnt;
+        for (auto& c : _population) ++cnt[c.skillLine];
+        for (auto& [sl, n] : cnt) _professionShare[sl] = double(n) / _population.size();
+    }
+
     uint32_t below = 0;
     for (auto& c : _population) if (c.leveling()) ++below;
     LOG_INFO("module", "CMangosAHBot[craft]: population rolled — {} crafters (cap={} below-cap={} "
@@ -564,45 +707,90 @@ void CMangosAHBot::UpdatePopulationCaps()
         c.cap = cap; // skills persist; crafters resume leveling toward the new cap
 }
 
-void CMangosAHBot::RunLevelingSessions(std::vector<Crafter>& pop, uint32_t n,
-                                       CMangosAHBotCost& cost, std::vector<CraftListing>& out)
+void CMangosAHBot::RunSessions(std::vector<Crafter>& pop, uint32_t n, CMangosAHBotCost& cost,
+                              std::vector<CraftListing>& out, bool production,
+                              std::unordered_map<uint32_t, uint32_t>& cdCount)
 {
     const auto& cfg = gCMangosAHBotConfig;
     if (pop.empty())
         return;
+
+    const uint8_t era = std::min<uint8_t>(_caps.maxExpansion, 2);
+    auto stateBoost = [&](uint8_t cat) -> uint32_t {
+        auto b = _stateBoost.find(uint32_t(_caps.state) * CAT_COUNT + cat);
+        return b == _stateBoost.end() ? 100 : b->second;
+    };
+    auto overrideW = [&](uint32_t item) -> uint32_t {
+        auto o = _overrides.find(item);
+        if (o == _overrides.end()) return 100;
+        if (o->second.value == 0 && o->second.addChance == 0) return 0; // blacklist => never craft
+        return o->second.craftWeight < 0 ? 100 : uint32_t(o->second.craftWeight);
+    };
 
     for (uint32_t s = 0; s < n; ++s)
     {
         if (!sCMangosAHBotRng->RollPct(cfg.craftChance))
             continue;
         Crafter& cr = pop[sCMangosAHBotRng->Urand(0, uint32_t(pop.size() - 1))];
-        if (!cr.leveling())
-            continue; // at cap => production, disabled in C3
-
         auto it = _craftCandidates.find(cr.skillLine);
         if (it == _craftCandidates.end())
             continue;
-        const CraftRecipe* r = CraftSim::ChooseLevelingRecipe(it->second, cr.skill, cost,
-                                                              _craftChances, sCMangosAHBotRng->Engine());
-        if (!r)
-            continue;
 
-        uint32_t batch = sCMangosAHBotRng->Urand(cfg.craftBatchLevelingMin, cfg.craftBatchLevelingMax);
-        CraftSim::SimulateSkillUps(cr, *r, batch, _craftChances, sCMangosAHBotRng->Engine());
+        const CraftRecipe* r = nullptr;
+        uint32_t batch = 0, marginPct = 0;
+
+        if (cr.leveling())
+        {
+            // §4.4 leveling: cheapest skill-up-per-gold, dump below cost.
+            r = CraftSim::ChooseLevelingRecipe(it->second, cr.skill, cost, _craftChances,
+                                               sCMangosAHBotRng->Engine());
+            if (!r) continue;
+            batch = sCMangosAHBotRng->Urand(cfg.craftBatchLevelingMin, cfg.craftBatchLevelingMax);
+            CraftSim::SimulateSkillUps(cr, *r, batch, _craftChances, sCMangosAHBotRng->Engine());
+            marginPct = sCMangosAHBotRng->Urand(cfg.craftMarginLevelingMin, cfg.craftMarginLevelingMax);
+        }
+        else
+        {
+            if (!production) continue; // C3 mode leaves at-cap crafters idle
+            // §5.2 production: demand-weighted recipe choice.
+            uint32_t ilvlCap = (_caps.itemLevelCap == NOCAP) ? 100000u : _caps.itemLevelCap;
+            r = CraftSim::ChooseProductionRecipe(it->second, _demandWeights[era], ilvlCap,
+                                                 cfg.craftGearWindow, stateBoost, overrideW,
+                                                 sCMangosAHBotRng->Engine());
+            if (!r) continue;
+
+            if (r->dailyCooldown)
+            {
+                // §4.5 daily-cooldown scarcity: cap output at #crafters-in-profession.
+                double share = _professionShare.count(cr.skillLine) ? _professionShare[cr.skillLine] : 0.0;
+                uint32_t cap = std::max(1u, uint32_t(std::lround(cfg.craftPopulation * share * cfg.craftCooldownPerCrafter)));
+                if (cdCount[r->spellId] >= cap) continue;
+                ++cdCount[r->spellId];
+                batch = 1; // one cooldown craft
+            }
+            else
+                batch = CraftSim::CategoryBatch(uint8_t(r->category), sCMangosAHBotRng->Engine());
+
+            auto ov = _overrides.find(r->productItem);
+            if (ov != _overrides.end() && ov->second.craftMargin >= 0)
+                marginPct = uint32_t(ov->second.craftMargin);
+            else
+            {
+                auto [mlo, mhi] = MarginBand(uint8_t(r->rarity), r->dailyCooldown);
+                marginPct = sCMangosAHBotRng->Urand(mlo, mhi);
+            }
+        }
 
         uint64_t matcost = CraftSim::MatCost(*r, cost);
-        uint32_t margin  = sCMangosAHBotRng->Urand(cfg.craftMarginLevelingMin, cfg.craftMarginLevelingMax);
-        uint64_t unit    = matcost * margin / 100; // leveling dump: below cost by construction
-
         CraftListing L;
         L.itemId      = r->productItem;
         L.count       = batch * r->productCount;
-        L.unitPrice   = unit;
+        L.unitPrice   = matcost * marginPct / 100;
         L.unitMatCost = matcost;
         L.skillLine   = r->skillLine;
         L.category    = static_cast<uint8_t>(r->category);
         out.push_back(L);
-        // ledger.Credit(reagents) is the buyer's demand ledger — C5.
+        // ledger.Credit(reagents x batch) is the buyer's demand ledger — C5.
     }
 }
 
@@ -629,9 +817,13 @@ void CMangosAHBot::CraftSellPass(Player* bot, uint32_t houseIdx)
     CMangosAHBotCost cost(src, anchor);
     cost.NewPass();
 
+    // Rolling 24h window for daily-cooldown output (§4.5).
+    uint32_t now = static_cast<uint32_t>(time(nullptr));
+    if (_cdWindowStart == 0 || now - _cdWindowStart >= 86400) { _cdCountLive.clear(); _cdWindowStart = now; }
+
     std::vector<CraftListing> listings;
     uint32_t nSessions = sCMangosAHBotRng->Urand(cfg.craftSessionsMin, cfg.craftSessionsMax);
-    RunLevelingSessions(_population, nSessions, cost, listings);
+    RunSessions(_population, nSessions, cost, listings, /*production=*/true, _cdCountLive);
     if (listings.empty())
         return;
 
@@ -724,11 +916,12 @@ std::string CMangosAHBot::CraftSimulateSessions(uint32_t n) const
     CMangosAHBotCost cost(src, anchor);
     cost.NewPass();
 
-    // Simulate on a COPY so the snapshot is non-destructive (real leveling advances
+    // Simulate on a COPY so the snapshot is non-destructive (real sessions advance
     // the live population in CraftSellPass).
     std::vector<Crafter> pop = _population;
     std::vector<CraftListing> listings;
-    const_cast<CMangosAHBot*>(this)->RunLevelingSessions(pop, n, cost, listings);
+    std::unordered_map<uint32_t, uint32_t> cdCount;
+    const_cast<CMangosAHBot*>(this)->RunSessions(pop, n, cost, listings, /*production=*/true, cdCount);
 
     // Aggregate by item.
     struct Agg { uint64_t count=0; uint64_t price=0; uint64_t matcost=0; uint8_t cat=CAT_MISC; };
@@ -1079,8 +1272,10 @@ void CMangosAHBot::BuildDisenchantPool()
 void CMangosAHBot::LoadOverrides()
 {
     _overrides.clear();
+    // craft_weight / craft_margin are the additive §8.2 columns (NULL => no override).
     if (QueryResult r = CharacterDatabase.Query(
-            "SELECT item, value, add_chance, min_amount, max_amount FROM cmangos_ahbot_items"))
+            "SELECT item, value, add_chance, min_amount, max_amount, craft_weight, craft_margin "
+            "FROM cmangos_ahbot_items"))
     {
         do
         {
@@ -1090,6 +1285,8 @@ void CMangosAHBot::LoadOverrides()
             o.addChance = f[2].Get<uint32_t>();
             o.minAmount = f[3].Get<uint32_t>();
             o.maxAmount = f[4].Get<uint32_t>();
+            o.craftWeight = f[5].IsNull() ? -1 : int32_t(f[5].Get<uint32_t>());
+            o.craftMargin = f[6].IsNull() ? -1 : int32_t(f[6].Get<uint32_t>());
             _overrides[f[0].Get<uint32_t>()] = o;
         } while (r->NextRow());
     }

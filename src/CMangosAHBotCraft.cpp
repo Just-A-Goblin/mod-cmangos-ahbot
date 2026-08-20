@@ -107,6 +107,75 @@ namespace CraftSim
         return 450;
     }
 
+    const CraftRecipe* ChooseProductionRecipe(const std::vector<const CraftRecipe*>& profRecipes,
+                                              const uint32_t* catWeight, uint32_t ilvlCap,
+                                              uint32_t gearWindow,
+                                              const std::function<uint32_t(uint8_t)>& stateBoostPct,
+                                              const std::function<uint32_t(uint32_t)>& overrideWeightPct,
+                                              std::mt19937& rng)
+    {
+        // Distribute each category's weight ACROSS its available recipes, so a
+        // category's selection share tracks the configured weight regardless of how
+        // many recipes it happens to have (else 40 elixirs would bury 4 flasks). This
+        // refines §5.2's literal per-recipe formula toward its "demand weight" intent.
+        uint32_t catCount[CAT_COUNT] = {0};
+        for (const CraftRecipe* r : profRecipes)
+            if (r && r->available)
+                ++catCount[r->category];
+
+        std::vector<std::pair<double, const CraftRecipe*>> scored;
+        double total = 0.0;
+        for (const CraftRecipe* r : profRecipes)
+        {
+            if (!r || !r->available)
+                continue;
+            double w = catWeight[r->category];
+            if (w <= 0.0)
+                continue;
+            w /= double(catCount[r->category] ? catCount[r->category] : 1); // per-recipe share
+            // GEAR: triangular demand window peaking at the ilvl cap (§5.2).
+            if (r->category == CAT_GEAR)
+            {
+                uint32_t lo = ilvlCap > gearWindow ? ilvlCap - gearWindow : 0;
+                if (gearWindow == 0 || r->productIlvl < lo || r->productIlvl > ilvlCap)
+                    continue;
+                w *= double(r->productIlvl - lo) / double(gearWindow); // 0 at lo, 1 at cap
+            }
+            w *= stateBoostPct(r->category) / 100.0;
+            uint32_t ow = overrideWeightPct(r->productItem);
+            if (ow == 0)
+                continue;               // override: never craft
+            w *= ow / 100.0;
+            if (w <= 0.0)
+                continue;
+            total += w;
+            scored.emplace_back(total, r); // cumulative for sampling
+        }
+        if (scored.empty() || total <= 0.0)
+            return nullptr;
+        std::uniform_real_distribution<double> pick(0.0, total);
+        double roll = pick(rng);
+        for (auto& [cum, r] : scored)
+            if (roll <= cum)
+                return r;
+        return scored.back().second;
+    }
+
+    uint32_t CategoryBatch(uint8_t category, std::mt19937& rng)
+    {
+        auto u = [&](uint32_t a, uint32_t b) {
+            return std::uniform_int_distribution<uint32_t>(a, b)(rng);
+        };
+        switch (category)
+        {
+            case CAT_GEAR: case CAT_BAG: case CAT_GEM_CUT: return u(1, 3);
+            case CAT_FLASK: case CAT_ELIXIR_POT: case CAT_FOOD: return u(5, 20);
+            case CAT_AMMO:          return u(2, 5);
+            case CAT_INTERMEDIATE:  return u(5, 15);
+            default:                return u(1, 5);
+        }
+    }
+
     std::vector<Crafter> RollPopulation(uint32_t size,
                                         const std::vector<std::pair<uint32_t, uint32_t>>& weights,
                                         uint16_t cap, double alpha, double beta,

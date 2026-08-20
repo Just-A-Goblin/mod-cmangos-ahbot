@@ -24,6 +24,8 @@ struct CmAHBOverride
     uint32_t addChance = 0; // >0 => inject this item at this % chance, bypassing loot roll
     uint32_t minAmount = 0;
     uint32_t maxAmount = 0;
+    int32_t  craftWeight = -1; // §8.2: -1 no override (neutral 100); 0 never craft; else weight mult %
+    int32_t  craftMargin = -1; // §8.2: -1 no override; else margin %
 };
 
 // Singleton mirroring the CMaNGOS AuctionHouseBot class (plan §3).
@@ -90,11 +92,15 @@ private:
     void BuildPopulation();
     void UpdatePopulationCaps();     // on progression change: raise caps, keep skills
     void BuildCraftCandidates();     // skillLine -> available recipes (rebuilt with the mask)
-    // Run n leveling sessions over `pop`, appending would-be listings to `out`.
-    // Mutates `pop` (skill-ups). Production sessions are disabled in C3.
-    void RunLevelingSessions(std::vector<Crafter>& pop, uint32_t n, CMangosAHBotCost& cost,
-                             std::vector<CraftListing>& out);
+    void ParseDemand();              // demand weights + state boosts + profession shares (C4 §5)
+    // Run n sessions over `pop`, appending would-be listings to `out`. Mutates `pop`
+    // (skill-ups). Below-cap crafters level (§4.4); at-cap crafters produce (§5.2) when
+    // `production` is true. countCd tracks per-recipe CD output within the run (§4.5).
+    void RunSessions(std::vector<Crafter>& pop, uint32_t n, CMangosAHBotCost& cost,
+                     std::vector<CraftListing>& out, bool production,
+                     std::unordered_map<uint32_t, uint32_t>& cdCount);
     void CraftSellPass(Player* bot, uint32_t houseIdx); // real sessions -> posted listings
+    void CraftDemandSweep();  // C4: production category-mix across probe states (logged)
 
     // Simulation (Phase 4)
     void AddLootToItemMap(Player* bot, CmAHBItemMap& out);
@@ -175,6 +181,15 @@ private:
     std::vector<Crafter> _population;
     std::unordered_map<uint32_t, std::vector<const CraftRecipe*>> _craftCandidates;
     CraftSkillChances _craftChances;
+
+    // Demand model (C4 §5). _demandWeights[era][category]; _stateBoost keyed by
+    // state*CAT_COUNT+category -> mult%; _professionShare[skillLine] -> share of the
+    // population (for §4.5 CD caps). CD output tracked per spell in a rolling window.
+    uint32_t _demandWeights[3][CAT_COUNT] = {};
+    std::unordered_map<uint32_t, uint32_t> _stateBoost;
+    std::unordered_map<uint32_t, double>   _professionShare;
+    std::unordered_map<uint32_t, uint32_t> _cdCountLive; // spellId -> CD crafts in current window
+    uint32_t _cdWindowStart = 0;                          // unix; reset every 24h
 };
 
 #define sCMangosAHBot CMangosAHBot::instance()
